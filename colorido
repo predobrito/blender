@@ -1,0 +1,2085 @@
+# -*- coding: utf-8 -*-
+"""
+CENARIO 3D COLORIDO - PRIPYAT / USINA DE CHERNOBYL (1986) para o robo CHERNOBYL-01
+Cole na aba "Scripting" do Blender (3.6+ / 4.x / 5.x) e execute.
+Unidades em metros. Area ~150 x 150 m, centrada na origem.
+O robo parte da origem (0,0): area inicial 16 x 16 m livre de obstaculos.
+Eixos: +X leste, +Y norte, +Z cima. A usina fica no canto nordeste.
+A geracao leva de 30 s a alguns minutos; o Blender fica ocupado enquanto isso.
+"""
+import bpy
+import bmesh
+import random
+from math import pi, sin, cos, sqrt, atan2, hypot, radians
+from mathutils import Vector, Matrix
+
+SEED = 1986
+TAM = 150.0
+MET = TAM / 2.0
+Z_VIA = 0.06            # topo das lajes das ruas
+Z_CAL = 0.12            # topo das calcadas
+PASSO_TERRENO = 0.75
+CAL_L = 2.5             # largura das calcadas
+NOMES_COLECOES = ["TERRENO", "RUAS_E_CALCADAS", "EDIFICIOS", "USINA_NUCLEAR",
+                  "VEGETACAO", "VEICULOS", "DESTROCOS", "SINALIZACAO", "ILUMINACAO"]
+COL = {}
+MATS = {}
+CUBO_F = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+
+
+# ----------------------------------------------------------------------------
+# CENA, COLECOES, MATERIAIS
+# ----------------------------------------------------------------------------
+def limpar_cena():
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o, do_unlink=True)
+    for c in list(bpy.data.collections):
+        bpy.data.collections.remove(c)
+    for me in list(bpy.data.meshes):
+        if me.users == 0:
+            bpy.data.meshes.remove(me)
+
+
+def criar_colecoes():
+    for n in NOMES_COLECOES:
+        c = bpy.data.collections.new(n)
+        bpy.context.scene.collection.children.link(c)
+        COL[n] = c
+
+
+def mat_cor(nome, cor, rug=0.9, var=0.18, escala=2.5, cor2=None, ruido2=0.0):
+    """Material colorido com variacao procedural (ruido -> rampa de cor)."""
+    m = bpy.data.materials.new(nome)
+    m.use_nodes = True
+    m.diffuse_color = (cor[0], cor[1], cor[2], 1)
+    nt = m.node_tree
+    b = nt.nodes.get("Principled BSDF")
+    if not b:
+        return m
+    b.inputs["Roughness"].default_value = rug
+    b.inputs["Base Color"].default_value = (cor[0], cor[1], cor[2], 1)
+    try:
+        tc = nt.nodes.new("ShaderNodeTexCoord")
+        n1 = nt.nodes.new("ShaderNodeTexNoise")
+        n1.inputs["Scale"].default_value = escala
+        n1.inputs["Detail"].default_value = 6.0
+        rp = nt.nodes.new("ShaderNodeValToRGB")
+        c0 = cor2 if cor2 else tuple(max(0.0, c * (1 - var)) for c in cor)
+        c1 = tuple(min(1.0, c * (1 + var)) for c in cor)
+        rp.color_ramp.elements[0].color = (c0[0], c0[1], c0[2], 1)
+        rp.color_ramp.elements[1].color = (c1[0], c1[1], c1[2], 1)
+        rp.color_ramp.elements[0].position = 0.35
+        rp.color_ramp.elements[1].position = 0.65
+        nt.links.new(tc.outputs["Object"], n1.inputs["Vector"])
+        nt.links.new(n1.outputs["Fac"], rp.inputs["Fac"])
+        nt.links.new(rp.outputs["Color"], b.inputs["Base Color"])
+    except Exception as ex:
+        print("variacao de cor ignorada:", ex)
+    return m
+
+
+def criar_materiais():
+    MATS["terra"] = mat_cor("COR_TERRA_GRAMA", (0.20, 0.27, 0.10), 0.95, 0.35, 0.35, cor2=(0.30, 0.22, 0.12))
+    MATS["asfalto"] = mat_cor("COR_ASFALTO", (0.075, 0.075, 0.08), 0.85, 0.35, 3.0)
+    MATS["concreto"] = mat_cor("COR_CONCRETO", (0.46, 0.45, 0.41), 0.92, 0.22, 2.0)
+    MATS["predio_0"] = mat_cor("COR_PREDIO_BEGE", (0.56, 0.52, 0.42), 0.92, 0.18, 0.7)
+    MATS["predio_1"] = mat_cor("COR_PREDIO_CINZA", (0.48, 0.48, 0.46), 0.92, 0.18, 0.7)
+    MATS["predio_2"] = mat_cor("COR_PREDIO_OCRE", (0.60, 0.54, 0.36), 0.92, 0.18, 0.7)
+    MATS["predio_3"] = mat_cor("COR_PREDIO_AZULADO", (0.42, 0.47, 0.50), 0.92, 0.18, 0.7)
+    MATS["predio"] = MATS["predio_0"]
+    MATS["usina"] = mat_cor("COR_USINA", (0.50, 0.50, 0.48), 0.9, 0.20, 0.5)
+    MATS["veg"] = mat_cor("COR_VEGETACAO", (0.16, 0.24, 0.07), 0.95, 0.45, 4.0, cor2=(0.30, 0.22, 0.10))
+    MATS["entulho"] = mat_cor("COR_ENTULHO", (0.40, 0.38, 0.34), 0.95, 0.25, 6.0)
+    MATS["ferrugem"] = mat_cor("COR_FERRUGEM", (0.33, 0.14, 0.06), 0.75, 0.40, 5.0, cor2=(0.18, 0.10, 0.06))
+    MATS["metal"] = mat_cor("COR_METAL", (0.20, 0.22, 0.20), 0.7, 0.25, 4.0, cor2=(0.30, 0.17, 0.08))
+    MATS["sinal"] = mat_cor("COR_SINAL", (0.72, 0.55, 0.08), 0.6, 0.25, 8.0, cor2=(0.40, 0.32, 0.08))
+    MATS["luz"] = mat_cor("COR_ILUMINACAO", (0.17, 0.18, 0.17), 0.7, 0.2, 4.0)
+    veic = [("veic_sedan", (0.55, 0.20, 0.12)), ("veic_perua", (0.58, 0.55, 0.40)), ("veic_van", (0.28, 0.36, 0.22)),
+            ("veic_truck", (0.15, 0.30, 0.42)), ("veic_dump", (0.62, 0.42, 0.10)), ("veic_bus", (0.60, 0.30, 0.10)),
+            ("veic_trator", (0.12, 0.30, 0.45))]
+    for k, c in veic:
+        MATS[k] = mat_cor("COR_" + k.upper(), c, 0.55, 0.35, 5.0, cor2=(0.25, 0.12, 0.06))
+    MATS["veic"] = MATS["veic_sedan"]
+
+
+# ----------------------------------------------------------------------------
+# MALHA ACUMULADORA (varias primitivas em uma unica malha)
+# ----------------------------------------------------------------------------
+def _ico(tmp, sub, r):
+    try:
+        bmesh.ops.create_icosphere(tmp, subdivisions=sub, radius=r)
+    except TypeError:
+        bmesh.ops.create_icosphere(tmp, subdivisions=sub, diameter=r)
+
+
+class Malha:
+    def __init__(self, nome):
+        self.nome = nome
+        self.bm = bmesh.new()
+        self.base = Matrix.Identity(4)
+        self.pilha = []
+
+    def push(self, M):
+        self.pilha.append(self.base)
+        self.base = self.base @ M
+
+    def pop(self):
+        self.base = self.pilha.pop()
+
+    def _face(self, vs, idx, suave=False):
+        try:
+            f = self.bm.faces.new([vs[i] for i in idx])
+            f.smooth = suave
+        except ValueError:
+            pass
+
+    def box(self, c, s, yaw=0.0, rx=0.0, ry=0.0):
+        if min(s) < 1e-4:
+            return
+        hx, hy, hz = s[0] / 2.0, s[1] / 2.0, s[2] / 2.0
+        co = [(-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
+              (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz)]
+        c = Vector(c)
+        if yaw == 0.0 and rx == 0.0 and ry == 0.0:
+            vs = [self.bm.verts.new(self.base @ (c + Vector(p))) for p in co]
+        else:
+            R = Matrix.Rotation(yaw, 4, 'Z') @ Matrix.Rotation(ry, 4, 'Y') @ Matrix.Rotation(rx, 4, 'X')
+            vs = [self.bm.verts.new(self.base @ (c + (R @ Vector(p)))) for p in co]
+        for f in CUBO_F:
+            self._face(vs, f)
+
+    def cil(self, c, r, h, eixo=(0, 0, 1), seg=12, r2=None, tampas=True, suave=True):
+        if h < 1e-4:
+            return
+        r2 = r if r2 is None else r2
+        a = Vector(eixo).normalized()
+        q = Vector((0, 0, 1)).rotation_difference(a)
+        M = self.base @ Matrix.Translation(Vector(c)) @ q.to_matrix().to_4x4()
+        hh = h / 2.0
+        r0 = [self.bm.verts.new(M @ Vector((r * cos(2 * pi * i / seg), r * sin(2 * pi * i / seg), -hh))) for i in range(seg)]
+        r1 = [self.bm.verts.new(M @ Vector((r2 * cos(2 * pi * i / seg), r2 * sin(2 * pi * i / seg), hh))) for i in range(seg)]
+        for i in range(seg):
+            j = (i + 1) % seg
+            self._face(r0 + r1, (i, j, seg + j, seg + i), suave)
+        if tampas:
+            self._face(r0, list(range(seg))[::-1])
+            self._face(r1, list(range(seg)))
+
+    def tubo(self, p1, p2, r, seg=6, r2=None):
+        p1, p2 = Vector(p1), Vector(p2)
+        d = p2 - p1
+        if d.length < 1e-5:
+            return
+        self.cil((p1 + p2) / 2.0, r, d.length, d, seg=seg, r2=r2, tampas=True, suave=False)
+
+    def barra(self, p1, p2, wy, wz):
+        p1, p2 = Vector(p1), Vector(p2)
+        d = p2 - p1
+        if d.length < 1e-5:
+            return
+        M = Matrix.Translation((p1 + p2) / 2.0) @ d.to_track_quat('X', 'Z').to_matrix().to_4x4()
+        self.push(M)
+        self.box((0, 0, 0), (d.length, wy, wz))
+        self.pop()
+
+    def prisma(self, pts, w0, w1, plano='XY'):
+        """Poligono 2D extrudado. XY: (x,y)->z em [w0,w1]; XZ: (x,z)->y; YZ: (y,z)->x."""
+        def P(u, v, w):
+            if plano == 'XY':
+                return (u, v, w)
+            if plano == 'XZ':
+                return (u, w, v)
+            return (w, u, v)
+        a = [self.bm.verts.new(self.base @ Vector(P(u, v, w0))) for u, v in pts]
+        b = [self.bm.verts.new(self.base @ Vector(P(u, v, w1))) for u, v in pts]
+        n = len(pts)
+        vs = a + b
+        self._face(vs, list(range(n))[::-1])
+        self._face(vs, list(range(n, 2 * n)))
+        for i in range(n):
+            j = (i + 1) % n
+            self._face(vs, (i, j, n + j, n + i))
+
+    def esfera(self, c, r, esc=(1, 1, 1), jit=0.0, rng=None, sub=1):
+        tmp = bmesh.new()
+        _ico(tmp, sub, r)
+        c = Vector(c)
+        mp = {}
+        for v in tmp.verts:
+            p = Vector((v.co.x * esc[0], v.co.y * esc[1], v.co.z * esc[2]))
+            if jit and rng:
+                p *= 1.0 + rng.uniform(-jit, jit)
+            mp[v] = self.bm.verts.new(self.base @ (c + p))
+        for f in tmp.faces:
+            self._face([mp[v] for v in f.verts], range(len(f.verts)))
+        tmp.free()
+
+    def lamina(self, pts):
+        vs = [self.bm.verts.new(self.base @ Vector(p)) for p in pts]
+        n = len(vs)
+        self._face(vs, range(n))
+        self._face(vs, list(range(n))[::-1])
+
+    def toro(self, c, R, r, eixo=(0, 0, 1), maj=24, mi=6):
+        a = Vector(eixo).normalized()
+        q = Vector((0, 0, 1)).rotation_difference(a)
+        M = self.base @ Matrix.Translation(Vector(c)) @ q.to_matrix().to_4x4()
+        vs = []
+        for i in range(maj):
+            t = 2 * pi * i / maj
+            for j in range(mi):
+                b = 2 * pi * j / mi
+                rr = R + r * cos(b)
+                vs.append(self.bm.verts.new(M @ Vector((rr * cos(t), rr * sin(t), r * sin(b)))))
+        for i in range(maj):
+            for j in range(mi):
+                i2, j2 = (i + 1) % maj, (j + 1) % mi
+                self._face(vs, (i * mi + j, i2 * mi + j, i2 * mi + j2, i * mi + j2), True)
+
+    def cabo(self, pts, r, seg=6, juntas=False):
+        pts = [Vector(p) for p in pts]
+        for a, b in zip(pts[:-1], pts[1:]):
+            self.tubo(a, b, r, seg)
+        if juntas:
+            for i in range(1, len(pts) - 1):
+                self.cil(pts[i], r * 1.15, r * 2.2, pts[i + 1] - pts[i - 1], seg=seg, tampas=False)
+
+    def lathe(self, perfil, seg=28, esp=0.3, fechar_topo=True):
+        """Casca de revolucao (perfil = [(raio, z)...]) com espessura (face externa + interna)."""
+        n = len(perfil)
+        ext, inn = [], []
+        for (r, z) in perfil:
+            ext.append([self.bm.verts.new(self.base @ Vector((r * cos(2 * pi * i / seg), r * sin(2 * pi * i / seg), z))) for i in range(seg)])
+            ri = max(r - esp, 0.05)
+            inn.append([self.bm.verts.new(self.base @ Vector((ri * cos(2 * pi * i / seg), ri * sin(2 * pi * i / seg), z))) for i in range(seg)])
+        for k in range(n - 1):
+            for i in range(seg):
+                j = (i + 1) % seg
+                f = self.bm.faces.new((ext[k][i], ext[k][j], ext[k + 1][j], ext[k + 1][i]))
+                f.smooth = True
+                f = self.bm.faces.new((inn[k][j], inn[k][i], inn[k + 1][i], inn[k + 1][j]))
+                f.smooth = True
+        if fechar_topo:
+            for i in range(seg):
+                j = (i + 1) % seg
+                self.bm.faces.new((ext[-1][i], inn[-1][i], inn[-1][j], ext[-1][j]))
+        for i in range(seg):
+            j = (i + 1) % seg
+            self.bm.faces.new((ext[0][j], inn[0][j], inn[0][i], ext[0][i]))
+
+    def mesh(self, mat, bevel=0.0):
+        me = bpy.data.meshes.new(self.nome)
+        bmesh.ops.recalc_face_normals(self.bm, faces=self.bm.faces[:])
+        self.bm.to_mesh(me)
+        self.bm.free()
+        me.materials.append(MATS[mat])
+        return bake_bevel(me, bevel) if bevel > 0 else me
+
+    def objeto(self, col, mat, bevel=0.0):
+        me = self.mesh(mat, bevel)
+        o = bpy.data.objects.new(self.nome, me)
+        COL[col].objects.link(o)
+        return o
+
+
+def bake_bevel(mesh, larg, ang=radians(35)):
+    """Aplica um bevel (chanfro) diretamente na malha, para poder compartilhar a geometria."""
+    if len(mesh.polygons) == 0:
+        return mesh
+    try:
+        nome = mesh.name
+        tmp = bpy.data.objects.new("_tmp_bevel", mesh)
+        bpy.context.scene.collection.objects.link(tmp)
+        md = tmp.modifiers.new("b", 'BEVEL')
+        md.width = larg
+        md.segments = 1
+        md.limit_method = 'ANGLE'
+        md.angle_limit = ang
+        bpy.context.view_layer.update()
+        dg = bpy.context.evaluated_depsgraph_get()
+        novo = bpy.data.meshes.new_from_object(tmp.evaluated_get(dg))
+        bpy.data.objects.remove(tmp, do_unlink=True)
+        bpy.data.meshes.remove(mesh)
+        novo.name = nome
+        return novo
+    except Exception as ex:
+        print("bevel ignorado:", ex)
+        return mesh
+
+
+def instancia(nome, mesh, col, loc, rot=(0, 0, 0), esc=1.0):
+    o = bpy.data.objects.new(nome, mesh)
+    o.location = loc
+    o.rotation_euler = rot
+    o.scale = (esc, esc, esc) if not isinstance(esc, (tuple, list)) else esc
+    COL[col].objects.link(o)
+    return o
+
+
+# ----------------------------------------------------------------------------
+# LAYOUT GERAL (retangulos alinhados aos eixos: x0, x1, y0, y1)
+# ----------------------------------------------------------------------------
+VIAS = [
+    dict(nome="A", eixo='x', c=0.0, l=8.0, a=-75.0, b=75.0, mat='asfalto', tile=4.0),
+    dict(nome="C", eixo='x', c=-40.0, l=7.0, a=-75.0, b=75.0, mat='asfalto', tile=4.0),
+    dict(nome="D", eixo='x', c=40.0, l=7.0, a=-75.0, b=75.0, mat='concreto', tile=3.0),
+    dict(nome="B", eixo='y', c=32.0, l=7.0, a=-75.0, b=45.0, mat='concreto', tile=2.5),
+]
+PRACA = (-8.0, 8.0, -8.0, 8.0)          # area inicial (16 x 16 m)
+LIVRE_INICIAL = (-9.5, 9.5, -9.5, 9.5)  # nada e colocado aqui
+POS_ROBO = (0.0, 0.0)
+
+# nome, tipo, cx, cy, yaw, L, W, andares, baia, colapso
+PREDIOS = [
+    ("Pred_R1", "res", -34.0, 17.0, 0.0, 43.2, 11.5, 9, 3.6, True),
+    ("Pred_R2", "res", -34.0, -17.0, pi, 43.2, 11.5, 9, 3.6, False),
+    ("Pred_R3", "res", 56.0, 17.0, 0.0, 32.4, 11.5, 5, 3.6, False),
+    ("Pred_R4", "res", 56.0, -17.0, pi, 32.4, 11.5, 9, 3.6, True),
+    ("Pred_R5", "res", -38.0, 52.0, 0.0, 43.2, 11.5, 9, 3.6, False),
+    ("Pred_R6", "res", -40.0, -52.0, pi, 43.2, 11.5, 5, 3.6, False),
+    ("Escola", "escola", 4.0, -54.0, pi, 40.5, 13.0, 3, 4.5, False),
+    ("Loja", "loja", 54.0, -55.0, pi, 30.0, 14.0, 1, 5.0, False),
+    ("Casa_de_Cultura", "cultura", -4.0, 54.0, 0.0, 20.0, 14.0, 2, 5.0, False),
+]
+RODA_GIGANTE = (-65.0, 30.0)            # roda-gigante
+RET_RODA = (-75.0, -55.0, 26.0, 34.0)
+RET_GARAGENS = (-68.0, -50.0, -33.0, -27.0)
+RET_USINA = (22.0, 74.0, 45.0, 74.5)    # patio cercado da usina
+RET_GALPOES = (44.0, 74.0, 25.5, 33.5)
+RET_TORRE_RESF = (6.0, 22.0, 58.0, 74.0)
+RET_PATIO1 = (12.0, 24.0, 14.0, 26.0)   # patios cercados (contaminacao)
+RET_PATIO2 = (12.0, 24.0, -26.0, -14.0)
+
+BURACOS = []          # (x, y, r) preenchido ao criar as ruas
+LEQUES = []
+
+
+def ret_via(v):
+    h = v['l'] / 2.0
+    if v['eixo'] == 'x':
+        return (v['a'], v['b'], v['c'] - h, v['c'] + h)
+    return (v['c'] - h, v['c'] + h, v['a'], v['b'])
+
+
+def ret_predio(p, margem=0.0):
+    _, _, cx, cy, _, L, W, _, _, _ = p
+    return (cx - L / 2 - margem, cx + L / 2 + margem, cy - W / 2 - margem, cy + W / 2 + margem)
+
+
+def expandir(r, m):
+    return (r[0] - m, r[1] + m, r[2] - m, r[3] + m)
+
+
+def dist_ret(x, y, r):
+    dx = max(r[0] - x, 0.0, x - r[1])
+    dy = max(r[2] - y, 0.0, y - r[3])
+    return hypot(dx, dy)
+
+
+def dentro(x, y, r, m=0.0):
+    return r[0] - m <= x <= r[1] + m and r[2] - m <= y <= r[3] + m
+
+
+def rects_planos():
+    L = [expandir(ret_via(v), CAL_L + 0.5) for v in VIAS]
+    L.append(PRACA)
+    L += [ret_predio(p, 6.0) for p in PREDIOS]
+    L += [expandir(RET_USINA, 1.5), RET_RODA, RET_GARAGENS, expandir(RET_GALPOES, 1.5),
+          expandir(RET_TORRE_RESF, 1.0), expandir(RET_PATIO1, 1.5), expandir(RET_PATIO2, 1.5)]
+    return L
+
+
+def rects_bloqueio(m):
+    """Regioes onde arvores/arbustos nao crescem (margem m)."""
+    L = [expandir(ret_via(v), CAL_L + m) for v in VIAS]
+    L.append(expandir(LIVRE_INICIAL, 1.0))
+    L += [ret_predio(p, 5.5 + m) for p in PREDIOS]
+    L += [expandir(r, m) for r in (RET_USINA, RET_RODA, RET_GARAGENS, RET_GALPOES, RET_TORRE_RESF,
+                                    RET_PATIO1, RET_PATIO2)]
+    return L
+
+
+def bloqueado(x, y, rects):
+    for r in rects:
+        if r[0] <= x <= r[1] and r[2] <= y <= r[3]:
+            return True
+    return False
+
+
+# ----------------------------------------------------------------------------
+# TERRENO (superficie continua com desniveis suaves; plano sob ruas e predios)
+# ----------------------------------------------------------------------------
+def _suave(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+def ruido(x, y):
+    return (0.55 * sin(x * 0.083 + 1.7) * cos(y * 0.071 + 0.6) + 0.30 * sin(x * 0.19 + y * 0.16 + 2.0)
+            + 0.14 * sin(x * 0.47 - y * 0.39 + 0.5) + 0.05 * sin(x * 1.3 + y * 1.1))
+
+
+def micro(x, y):
+    return 0.035 * sin(x * 2.9 + y * 1.7) * cos(y * 3.3 - x * 1.1) + 0.02 * sin(x * 6.1 + y * 5.3)
+
+
+_PLANOS = None
+
+
+def alt(x, y):
+    """Altura do terreno em (x, y)."""
+    global _PLANOS
+    if _PLANOS is None:
+        _PLANOS = rects_planos()
+    d = min(dist_ret(x, y, r) for r in _PLANOS)
+    s = _suave((d - 0.5) / 8.0)
+    z = (0.8 * ruido(x, y) + micro(x, y)) * s
+    for (px, py, pr) in BURACOS:
+        dd = hypot(x - px, y - py)
+        if dd < pr:
+            z -= 0.075 * (1.0 - (dd / pr) ** 2)
+    return z
+
+
+def construir_terreno():
+    n = int(TAM / PASSO_TERRENO)
+    paso = TAM / n
+    m = Malha("Terreno")
+    bm = m.bm
+    V = []
+    for j in range(n + 1):
+        fila = []
+        for i in range(n + 1):
+            x = -MET + i * paso
+            y = -MET + j * paso
+            fila.append(bm.verts.new((x, y, alt(x, y))))
+        V.append(fila)
+    for j in range(n):
+        for i in range(n):
+            bm.faces.new((V[j][i], V[j][i + 1], V[j + 1][i + 1], V[j + 1][i]))
+    # saia lateral (bloco solido)
+    borda = [[V[0][i] for i in range(n + 1)], [V[j][n] for j in range(n + 1)],
+             [V[n][i] for i in range(n, -1, -1)], [V[j][0] for j in range(n, -1, -1)]]
+    prof = -2.0
+    for lado in borda:
+        baixo = [bm.verts.new((v.co.x, v.co.y, prof)) for v in lado]
+        for k in range(len(lado) - 1):
+            bm.faces.new((lado[k], lado[k + 1], baixo[k + 1], baixo[k]))
+    bm.faces.new([bm.verts.new((-MET, -MET, prof)), bm.verts.new((-MET, MET, prof)),
+                  bm.verts.new((MET, MET, prof)), bm.verts.new((MET, -MET, prof))])
+    o = m.objeto("TERRENO", "terra")
+    return o
+
+
+# ----------------------------------------------------------------------------
+# RUAS E CALCADAS (lajes individuais com frestas, buracos e lajes levantadas)
+# ----------------------------------------------------------------------------
+def subtrair(a, b, cortes):
+    segs = [(a, b)]
+    for c0, c1 in cortes:
+        novo = []
+        for s0, s1 in segs:
+            if c1 <= s0 or c0 >= s1:
+                novo.append((s0, s1))
+                continue
+            if c0 > s0:
+                novo.append((s0, c0))
+            if c1 < s1:
+                novo.append((c1, s1))
+        segs = novo
+    return segs
+
+
+def laje(m, cx, cy, sx, sy, ztop, esp, rng, diag, levant, gap):
+    zc = ztop + rng.uniform(-0.010, 0.010) - esp / 2.0
+    a = sx / 2.0 - gap / 2.0
+    b = sy / 2.0 - gap / 2.0
+    if diag:
+        sg = 1 if rng.random() < 0.5 else -1
+        t1 = [(-a, -b), (a, -b), (a, b)] if sg > 0 else [(-a, -b), (a, -b), (-a, b)]
+        t2 = [(-a, -b), (a, b), (-a, b)] if sg > 0 else [(a, -b), (a, b), (-a, b)]
+        for t in (t1, t2):
+            gx = sum(p[0] for p in t) / 3.0
+            gy = sum(p[1] for p in t) / 3.0
+            pts = [(cx + gx + (p[0] - gx) * 0.96, cy + gy + (p[1] - gy) * 0.96) for p in t]
+            m.prisma(pts, zc - esp / 2.0 + rng.uniform(-0.008, 0.008), zc + esp / 2.0 + rng.uniform(-0.008, 0.008))
+    elif levant:
+        ang = rng.uniform(0.02, 0.055) * (1 if rng.random() < 0.5 else -1)
+        if rng.random() < 0.5:
+            m.box((cx, cy, zc + abs(ang) * a * 0.7), (2 * a, 2 * b, esp), ry=ang)
+        else:
+            m.box((cx, cy, zc + abs(ang) * b * 0.7), (2 * a, 2 * b, esp), rx=ang)
+    else:
+        m.box((cx, cy, zc), (2 * a, 2 * b, esp))
+
+
+def lajes(m, rect, tw, th, ztop, esp, rng, p_falta=0.0, p_diag=0.15, p_levant=0.07,
+          gap=0.06, buracos=None, protegido=None):
+    x0, x1, y0, y1 = rect
+    if x1 - x0 < 0.3 or y1 - y0 < 0.3:
+        return
+    nx = max(1, int(round((x1 - x0) / tw)))
+    ny = max(1, int(round((y1 - y0) / th)))
+    sx, sy = (x1 - x0) / nx, (y1 - y0) / ny
+    for i in range(nx):
+        for j in range(ny):
+            cx = x0 + (i + 0.5) * sx
+            cy = y0 + (j + 0.5) * sy
+            prot = protegido is not None and dentro(cx, cy, protegido, 2.5)
+            r = rng.random()
+            if not prot and r < p_falta:
+                if buracos is not None:
+                    buracos.append((cx, cy, min(sx, sy) * 0.62))
+                continue
+            laje(m, cx, cy, sx, sy, ztop, esp, rng, rng.random() < p_diag, (not prot) and rng.random() < p_levant, gap)
+
+
+def construir_ruas():
+    rng = random.Random(SEED + 1)
+    mats = {"asfalto": Malha("Ruas_Asfalto"), "concreto": Malha("Ruas_Concreto")}
+    cal = Malha("Calcadas_e_Meios_Fios")
+    xs = [v for v in VIAS if v['eixo'] == 'x']
+    ys = [v for v in VIAS if v['eixo'] == 'y']
+    prot = LIVRE_INICIAL
+    for v in VIAS:
+        m = mats[v['mat']]
+        h = v['l'] / 2.0
+        t = v['tile']
+        pf = 0.05 if v['mat'] == 'asfalto' else 0.04
+        if v['eixo'] == 'x':
+            lajes(m, ret_via(v), t, t, Z_VIA, ESP_LAJE_, rng, pf, 0.15, 0.06, 0.06, BURACOS, prot)
+        else:
+            segs = subtrair(v['a'], v['b'], [(x['c'] - x['l'] / 2, x['c'] + x['l'] / 2) for x in xs])
+            for (s0, s1) in segs:
+                lajes(m, (v['c'] - h, v['c'] + h, s0, s1), t, t, Z_VIA, ESP_LAJE_, rng, pf, 0.15, 0.06, 0.06, BURACOS, prot)
+    # calcadas + meios-fios
+    for v in VIAS:
+        h = v['l'] / 2.0
+        c = v['c']
+        if v['eixo'] == 'x':
+            cortes = [(y['c'] - y['l'] / 2, y['c'] + y['l'] / 2) for y in ys if y['a'] <= c <= y['b']]
+            if abs(c) < 5.0:
+                cortes.append((PRACA[0], PRACA[1]))
+            segs = subtrair(v['a'], v['b'], cortes)
+            for sg in (-1, 1):
+                ye = c + sg * h
+                y0, y1 = (ye, ye + CAL_L) if sg > 0 else (ye - CAL_L, ye)
+                for (s0, s1) in segs:
+                    lajes(cal, (s0, s1, y0, y1), 2.0, CAL_L / 2.0, Z_CAL, 0.22, rng, 0.07, 0.12, 0.10, 0.05)
+                    meio_fio(cal, rng, 'x', s0, s1, ye + sg * 0.075)
+        else:
+            cortes = [(x['c'] - x['l'] / 2 - CAL_L, x['c'] + x['l'] / 2 + CAL_L) for x in xs]
+            segs = subtrair(v['a'], v['b'], cortes)
+            for sg in (-1, 1):
+                xe = c + sg * h
+                x0, x1 = (xe, xe + CAL_L) if sg > 0 else (xe - CAL_L, xe)
+                for (s0, s1) in segs:
+                    lajes(cal, (x0, x1, s0, s1), CAL_L / 2.0, 2.0, Z_CAL, 0.22, rng, 0.07, 0.12, 0.10, 0.05)
+                    meio_fio(cal, rng, 'y', s0, s1, xe + sg * 0.075)
+    # praca inicial (16 x 16 m, plana e livre)
+    for (rr) in ((PRACA[0], PRACA[1], 4.0, PRACA[3]), (PRACA[0], PRACA[1], PRACA[2], -4.0)):
+        lajes(cal, rr, 2.0, 2.0, Z_VIA, ESP_LAJE_, rng, 0.0, 0.10, 0.0, 0.06)
+    for k, m in mats.items():
+        m.objeto("RUAS_E_CALCADAS", k, 0.012)
+    cal.objeto("RUAS_E_CALCADAS", "concreto", 0.012)
+
+
+ESP_LAJE_ = 0.30
+
+
+def meio_fio(m, rng, eixo, s0, s1, pos):
+    seg = 5.0
+    n = max(1, int(round((s1 - s0) / seg)))
+    L = (s1 - s0) / n
+    for i in range(n):
+        if rng.random() < 0.08:
+            continue
+        u = s0 + (i + 0.5) * L
+        if eixo == 'x':
+            m.box((u, pos, Z_CAL + 0.01 - 0.12), (L - 0.04, 0.15, 0.26))
+        else:
+            m.box((pos, u, Z_CAL + 0.01 - 0.12), (0.15, L - 0.04, 0.26))
+
+
+# ----------------------------------------------------------------------------
+# EDIFICIOS SOVIETICOS (paineis de concreto, janelas por celula, sacadas, buracos)
+# ----------------------------------------------------------------------------
+CFG = {
+    "res": dict(H=3.0, sill=0.9, wh=1.5, wmax=1.5, balcao=True),
+    "escola": dict(H=3.6, sill=0.9, wh=1.9, wmax=2.6, balcao=False),
+    "loja": dict(H=5.0, sill=0.5, wh=3.6, wmax=3.4, balcao=False),
+    "cultura": dict(H=5.0, sill=1.0, wh=2.6, wmax=1.6, balcao=False),
+}
+PL = 0.45   # soco elevado do predio
+
+
+def entulho_chao(m, rng, x, y, n, raio, zbase=0.0, evitar=None):
+    """Pedacos de concreto caidos (geometria fundida na malha do predio)."""
+    for _ in range(n):
+        a = rng.uniform(0, 2 * pi)
+        d = rng.uniform(0, raio)
+        px, py = x + cos(a) * d, y + sin(a) * d
+        if evitar and any(abs(px - ex) < 2.0 for ex in evitar):
+            continue
+        s = rng.uniform(0.2, 0.7)
+        m.box((px, py, zbase + s * 0.3), (s * rng.uniform(0.8, 1.6), s * rng.uniform(0.6, 1.3), s * 0.6),
+              yaw=rng.uniform(0, pi), rx=rng.uniform(-0.3, 0.3), ry=rng.uniform(-0.3, 0.3))
+
+
+def ferragens(m, rng, c, d, n=4):
+    """Vergalhoes expostos saindo de uma borda quebrada."""
+    c = Vector(c)
+    d = Vector(d).normalized()
+    for k in range(n):
+        off = Vector((rng.uniform(-0.5, 0.5), rng.uniform(-0.15, 0.15), rng.uniform(-0.4, 0.4)))
+        p = c + off
+        dd = (d + Vector((rng.uniform(-0.2, 0.2), rng.uniform(-0.2, 0.2), rng.uniform(-0.3, 0.1)))).normalized()
+        m.tubo(p, p + dd * rng.uniform(0.4, 1.0), 0.012, 5)
+
+
+def predio(nome, tipo, cx, cy, yaw, L, W, n, bw, colapso, seed, extra=None):
+    rng = random.Random(seed)
+    cfg = CFG[tipo]
+    H = cfg['H']
+    m = Malha(nome)
+    m.base = Matrix.Translation((cx, cy, 0)) @ Matrix.Rotation(yaw, 4, 'Z')
+    nb = max(2, int(round(L / bw)))
+    bw = L / nb
+    e = 0.40
+    ztopo = PL + n * H
+    entradas = [i for i in range(1, nb - 1, 3)] if tipo in ("res",) else ([nb // 2] if nb % 2 else [nb // 2 - 1, nb // 2])
+    if tipo == "loja":
+        entradas = [nb // 2 - 1, nb // 2]
+    ent_x = [-L / 2 + (i + 0.5) * bw for i in entradas]
+
+    # fundacao + lajes de piso
+    m.box((0, 0, (PL - 0.8) / 2.0), (L + 0.6, W + 0.6, PL + 0.8))
+    for f in range(0, n + 1):
+        z = PL + f * H
+        if f == n:
+            continue
+        if f >= n - 2 and rng.random() < 0.25 and n > 3:
+            m.box((-L * 0.18, 0, z), (L * 0.64, W - 0.8, 0.22))
+        else:
+            m.box((0, 0, z), (L - 0.8, W - 0.8, 0.22))
+
+    def P(eixo, lado, u, v, z, su, sv, sz, **kw):
+        if eixo == 'x':
+            m.box((u, lado * W / 2.0 + v, z), (su, sv, sz), **kw)
+        else:
+            m.box((lado * L / 2.0 + v, u, z), (sv, su, sz), **kw)
+
+    def parede(eixo, lado, frente):
+        comp = L if eixo == 'x' else W
+        nc = nb if eixo == 'x' else max(2, int(round(W / bw)))
+        cw = comp / nc
+        ww = min(cfg['wmax'], cw * 0.55)
+        for f in range(n):
+            z0 = PL + f * H
+            hole = []
+            tipos = []
+            larg = []
+            for i in range(nc):
+                u = -comp / 2.0 + (i + 0.5) * cw
+                h = False
+                if colapso and f >= n - 2 and ((eixo == 'x' and u > L / 2.0 - 2.3 * bw) or (eixo == 'y' and lado == 1)):
+                    h = True
+                elif rng.random() < 0.015 + 0.03 * f / max(1, n - 1):
+                    h = True
+                hole.append(h)
+                if eixo == 'x' and frente and f == 0 and i in entradas:
+                    tipos.append('porta')
+                    larg.append(1.7 if tipo != 'loja' else 2.6)
+                else:
+                    tipos.append('janela')
+                    larg.append(ww)
+            for i in range(nc):
+                u = -comp / 2.0 + (i + 0.5) * cw
+                if hole[i]:
+                    if f >= 1 or True:
+                        ferragens(m, rng, _p(eixo, lado, u, 0.0, z0 + H - 0.1), _d(eixo, lado, 0.7), 3)
+                    continue
+                if tipos[i] == 'porta':
+                    dh = 2.3 if tipo != 'loja' else 3.0
+                    P(eixo, lado, u, 0, z0 + dh + (H - dh) / 2.0, larg[i], e, H - dh)
+                    continue
+                sill, wh = cfg['sill'], cfg['wh']
+                P(eixo, lado, u, 0, z0 + sill / 2.0, larg[i], e, sill)
+                P(eixo, lado, u, 0, z0 + sill + wh + (H - sill - wh) / 2.0, larg[i], e, H - sill - wh)
+                # caixilho
+                r = rng.random()
+                zc = z0 + sill + wh / 2.0
+                if r < 0.50:
+                    P(eixo, lado, u - larg[i] / 2 + 0.03, 0.0, zc, 0.05, 0.10, wh)
+                    P(eixo, lado, u + larg[i] / 2 - 0.03, 0.0, zc, 0.05, 0.10, wh)
+                    P(eixo, lado, u, 0.0, zc, larg[i], 0.08, 0.04)
+                    P(eixo, lado, u, 0.0, z0 + sill + 0.03, larg[i], 0.10, 0.05)
+                elif r < 0.78:
+                    P(eixo, lado, u - larg[i] / 2 + 0.03, 0.0, zc, 0.05, 0.10, wh)
+                    P(eixo, lado, u, 0.0, z0 + sill + wh - 0.03, larg[i], 0.10, 0.05)
+                if r > 0.30 and r < 0.9:
+                    P(eixo, lado, u + rng.uniform(-0.3, 0.3), 0.05, z0 + sill + 0.08, 0.30, 0.02, 0.22,
+                      rx=rng.uniform(-0.6, 0.6))
+                # sacadas
+                if cfg['balcao'] and eixo == 'x' and frente and f >= 1 and i % 3 == 2:
+                    s = lado
+                    q = rng.random()
+                    if q < 0.12:
+                        pass
+                    elif q < 0.24:
+                        P('x', lado, u, s * 0.9, z0 - 0.55, 3.0, 1.1, 0.14, rx=0.65 * (-s))
+                    else:
+                        P('x', lado, u, s * 0.75, z0 - 0.07, 3.0, 1.1, 0.14)
+                        P('x', lado, u, s * 1.28, z0 + 0.5, 3.0, 0.08, 1.0)
+                        if rng.random() < 0.8:
+                            P('x', lado, u - 1.46, s * 0.75, z0 + 0.5, 0.08, 1.1, 1.0)
+                        if rng.random() < 0.8:
+                            P('x', lado, u + 1.46, s * 0.75, z0 + 0.5, 0.08, 1.1, 1.0)
+            # pilares entre vaos
+            for i in range(nc + 1):
+                if i > 0 and hole[i - 1]:
+                    continue
+                if i < nc and hole[i]:
+                    continue
+                lw = larg[i - 1] / 2.0 if i > 0 else 0.0
+                rw = larg[i] / 2.0 if i < nc else 0.0
+                ub = -comp / 2.0 + i * cw
+                left = ub - (cw / 2.0 - lw) if i > 0 else -comp / 2.0
+                right = ub + (cw / 2.0 - rw) if i < nc else comp / 2.0
+                if right - left > 0.05:
+                    P(eixo, lado, (left + right) / 2.0, 0, z0 + H / 2.0, right - left, e, H)
+        return
+
+    def _p(eixo, lado, u, v, z):
+        return (u, lado * W / 2.0 + v, z) if eixo == 'x' else (lado * L / 2.0 + v, u, z)
+
+    def _d(eixo, lado, k):
+        return (0, lado * k, 0) if eixo == 'x' else (lado * k, 0, 0)
+
+    parede('x', -1, True)
+    parede('x', 1, False)
+    parede('y', -1, False)
+    parede('y', 1, False)
+
+    # interior: parede-eixo, paredes transversais, escadas
+    for f in range(n):
+        z0 = PL + f * H
+        for i in range(nb):
+            u = -L / 2.0 + (i + 0.5) * bw
+            if rng.random() > 0.18 and not (colapso and f >= n - 2 and u > L / 2.0 - 2.3 * bw):
+                m.box((u, 0, z0 + H / 2.0), (bw - 0.1, 0.22, H - 0.22))
+        for i in range(2, nb - 1, 2):
+            u = -L / 2.0 + i * bw
+            if rng.random() > 0.25 and not (colapso and f >= n - 2 and u > L / 2.0 - 2.3 * bw):
+                m.box((u, 0, z0 + H / 2.0), (0.2, W - 0.8, H - 0.22))
+    if tipo in ("res", "escola"):
+        for i in entradas:
+            u = -L / 2.0 + (i + 0.5) * bw
+            ns = int(H / 0.18)
+            rr, dd = H / ns, 0.27
+            pf = [(0, 0)]
+            for k in range(ns):
+                pf += [(k * dd, (k + 1) * rr), ((k + 1) * dd, (k + 1) * rr)]
+            pf += [(ns * dd, 0)]
+            for f in range(n):
+                y0 = -W / 2.0 + 2.6
+                pts = [(y0 + a, z) for a, z in pf]
+                m.prisma([(a, PL + f * H + z) for a, z in pts], u - 0.65, u + 0.65, 'YZ')
+
+    # entradas: rampa, corrimao, marquise
+    for i in entradas:
+        u = -L / 2.0 + (i + 0.5) * bw
+        yw = -W / 2.0 - e / 2.0
+        wd = 1.0 if tipo != 'loja' else 1.8
+        m.prisma([(yw, -0.2), (yw, PL), (yw - 4.6, 0.0), (yw - 4.6, -0.2)], u - wd, u + wd, 'YZ')
+        for sg in (-1, 1):
+            m.tubo((u + sg * (wd + 0.12), yw - 0.1, PL + 0.9), (u + sg * (wd + 0.12), yw - 4.5, 0.9), 0.025, 6)
+            for k in (0.0, 2.2, 4.4):
+                zz = PL + 0.9 - (PL * k / 4.6)
+                m.tubo((u + sg * (wd + 0.12), yw - 0.1 - k, 0.0), (u + sg * (wd + 0.12), yw - 0.1 - k, zz), 0.025, 6)
+        m.box((u, -W / 2.0 - 0.9, PL + (H if tipo != 'loja' else 3.6) - 0.1), (3.2 if tipo != 'loja' else 5.2, 2.0, 0.2))
+        for sg in (-1, 1):
+            m.box((u + sg * 1.5, -W / 2.0 - 0.9, PL + H - 0.45), (0.15, 2.0, 0.7 if tipo != 'loja' else 0.5))
+        # porta aberta (folha girada)
+        a = rng.uniform(1.0, 1.5)
+        hx = u - 0.75
+        m.box((hx + cos(a) * 0.38, -W / 2.0 - sin(a) * 0.38, PL + 1.1), (0.76, 0.06, 2.2), yaw=-a)
+
+    # entulho junto as paredes e ao canto colapsado
+    for _ in range(int(2 + n * 0.8)):
+        u = rng.uniform(-L / 2.0 + 1, L / 2.0 - 1)
+        entulho_chao(m, rng, u, rng.choice([-1, 1]) * (W / 2.0 + 1.3), rng.randint(2, 4), 1.0, 0.0, ent_x)
+    if colapso:
+        entulho_chao(m, rng, L / 2.0 - 3.0, W / 2.0 + 1.5, 20, 4.5, 0.0)
+        entulho_chao(m, rng, L / 2.0 + 1.5, 0.0, 14, 3.5, 0.0)
+
+    # tubulacoes externas
+    for i in range(0, nb + 1, 3):
+        ub = -L / 2.0 + i * bw
+        if i == 0 or i == nb:
+            ub = ub + (0.5 if i == 0 else -0.5)
+        for sg in (-1, 1):
+            zt = ztopo - 0.4 if rng.random() > 0.25 else ztopo - rng.uniform(4, 8)
+            m.cil((ub, sg * (W / 2.0 + 0.18), (PL + zt) / 2.0), 0.07, zt - PL, seg=8)
+            for f in range(0, n, 2):
+                m.box((ub, sg * (W / 2.0 + 0.12), PL + f * H + 1.0), (0.14, 0.14, 0.06))
+    cabo_gas = [(-L / 2.0 + 1.0, -W / 2.0 - 0.3, PL + 0.7), (L / 2.0 - 1.0, -W / 2.0 - 0.3, PL + 0.7)]
+    m.cabo(cabo_gas, 0.045)
+    for k in range(6):
+        u = -L / 2.0 + 1.0 + k * (L - 2.0) / 5.0
+        m.box((u, -W / 2.0 - 0.25, PL + 0.6), (0.06, 0.1, 0.25))
+
+    # cobertura: laje, parapeito, casa de maquinas, caixa d'agua, antenas
+    if tipo in ("res", "escola", "loja"):
+        m.box((0, 0, ztopo + 0.1), (L + 0.2, W + 0.2, 0.3))
+        for s in (-1, 1):
+            for (u0, u1) in ((-L / 2.0, -L / 8.0), (-L / 8.0, L / 2.0)):
+                if rng.random() > 0.15 and not (colapso and s == 1 and u1 > L / 3.0):
+                    m.box(((u0 + u1) / 2.0, s * (W / 2.0 - 0.1), ztopo + 0.7), (u1 - u0, 0.2, 0.9))
+        m.box((-L / 2.0 + 0.1, 0, ztopo + 0.7), (0.2, W, 0.9))
+        m.box((L / 2.0 - 0.1, 0, ztopo + 0.7), (0.2, W, 0.9)) if not colapso else None
+        if tipo == "res":
+            for u in (-L * 0.30, L * 0.05):
+                m.box((u, -W * 0.15, ztopo + 1.7), (3.2, 3.0, 2.8))
+                m.box((u, -W * 0.15 - 1.55, ztopo + 1.0), (1.0, 0.1, 1.6))
+            m.cil((-L * 0.05, W * 0.18, ztopo + 1.3), 1.2, 2.0, seg=16)
+            for k in range(4):
+                a = k * pi / 2 + pi / 4
+                m.cil((-L * 0.05 + cos(a) * 0.9, W * 0.18 + sin(a) * 0.9, ztopo + 0.6), 0.05, 0.8, seg=6)
+            for u in (-L * 0.4, L * 0.22, L * 0.34):
+                m.cil((u, W * 0.2, ztopo + 0.8), 0.13, 1.0, seg=10)
+                m.cil((u, W * 0.2, ztopo + 1.34), 0.2, 0.1, seg=10)
+            for u in (-L * 0.15, L * 0.18):
+                m.tubo((u, 0.5, ztopo + 0.25), (u, 0.5, ztopo + 4.5), 0.03, 5)
+                for k in range(3):
+                    m.box((u, 0.5, ztopo + 2.3 + k * 0.7), (0.05, 1.6 - k * 0.3, 0.03))
+        if tipo == "escola":
+            m.box((0, 0, ztopo + 1.2), (8.0, 5.0, 2.2))
+
+    if extra:
+        extra(m, rng, L, W, H, n, ztopo)
+    return m, ent_x
+
+
+def colunata_cultura(m, rng, L, W, H, n, ztopo):
+    """Casa de Cultura: portico de colunas, escadaria larga, volume alto, cobertura inclinada."""
+    zf = PL + n * H
+    m.box((0, 0, zf + 0.15), (L + 0.4, W + 0.4, 0.4))
+    m.box((0, -W / 2.0 - 3.0, zf - 0.6), (L - 2.0, 6.0, 0.5))
+    for k in range(7):
+        x = -L / 2.0 + 2.0 + k * (L - 4.0) / 6.0
+        m.cil((x, -W / 2.0 - 5.0, PL + (zf - PL) / 2.0 - 0.3), 0.42, zf - PL - 0.6, seg=14)
+        m.cil((x, -W / 2.0 - 5.0, PL + 0.1), 0.55, 0.2, seg=14)
+        m.cil((x, -W / 2.0 - 5.0, zf - 0.8), 0.55, 0.2, seg=14)
+    for k in range(3):
+        m.box((0, -W / 2.0 - 6.0 - k * 0.5, PL * (1 - (k + 1) / 4.0) - 0.05), (L - 2.0, 0.5, PL * (1 - (k + 1) / 4.0) + 0.1))
+    m.box((0, 2.0, zf + 2.2), (L * 0.6, W * 0.5, 4.0))
+    for s in (-1, 1):
+        m.box((s * (L / 2.0 + 0.2), 0, PL + 1.6), (0.4, W + 0.2, 3.2))
+
+
+# ----------------------------------------------------------------------------
+# RODA-GIGANTE, GARAGENS E PEQUENAS ESTRUTURAS
+# ----------------------------------------------------------------------------
+def roda_gigante():
+    rng = random.Random(SEED + 7)
+    m = Malha("Roda_Gigante")
+    cx, cy = RODA_GIGANTE
+    R, zh = 9.0, 10.6
+    m.push(Matrix.Translation((cx, cy, 0)))
+    N = 24
+    for yy in (-0.9, 0.9):
+        for k in range(N):
+            a0, a1 = 2 * pi * k / N, 2 * pi * (k + 1) / N
+            p0 = (R * cos(a0), yy, zh + R * sin(a0))
+            p1 = (R * cos(a1), yy, zh + R * sin(a1))
+            m.tubo(p0, p1, 0.07, 6)
+            m.tubo((R * 0.6 * cos(a0), yy, zh + R * 0.6 * sin(a0)),
+                   (R * 0.6 * cos(a1), yy, zh + R * 0.6 * sin(a1)), 0.04, 5)
+            m.tubo((0, yy, zh), p0, 0.035, 5)
+    for k in range(N):
+        a = 2 * pi * k / N
+        m.tubo((R * cos(a), -0.9, zh + R * sin(a)), (R * cos(a), 0.9, zh + R * sin(a)), 0.045, 5)
+    m.cil((0, 0, zh), 0.55, 2.4, (0, 1, 0), seg=20)
+    m.cil((0, 0, zh), 0.8, 0.3, (0, 1, 0), seg=20)
+    m.cil((0, 1.5, zh), 0.8, 0.3, (0, 1, 0), seg=20)
+    # gondolas (algumas faltam)
+    for k in range(12):
+        if k in (3, 8):
+            continue
+        a = 2 * pi * k / 12 + 0.12
+        gx, gz = R * cos(a), zh + R * sin(a)
+        m.tubo((gx, -0.9, gz), (gx, 0.9, gz), 0.05, 6)
+        m.box((gx, 0.0, gz - 0.95), (1.3, 1.1, 1.0), rx=rng.uniform(-0.05, 0.05))
+        m.box((gx, 0.0, gz - 0.35), (1.1, 1.0, 0.06))
+        m.box((gx, 0.0, gz - 0.35), (1.5, 1.3, 0.1))
+        for sx in (-1, 1):
+            m.tubo((gx + sx * 0.5, 0, gz - 0.4), (gx, 0, gz), 0.02, 5)
+    # cavaletes laterais
+    for yy in (-1.6, 1.6):
+        for sx in (-1, 1):
+            m.tubo((sx * 0.2, yy * 0.5, zh), (sx * 4.2, yy * 2.0, 0.0), 0.16, 8)
+            m.box((sx * 4.2, yy * 2.0, 0.15), (1.2, 1.2, 0.4))
+        m.tubo((-4.2, yy * 2.0, 1.2), (4.2, yy * 2.0, 1.2), 0.07, 6)
+    m.cil((0, 0, 1.0), 0.0001, 0.0001, seg=3)
+    m.pop()
+    m.objeto("EDIFICIOS", "predio", 0.02)
+
+
+def garagens():
+    rng = random.Random(SEED + 8)
+    m = Malha("Garagens")
+    x0, x1, y0, y1 = RET_GARAGENS
+    n = 6
+    w = (x1 - x0) / n
+    for i in range(n):
+        cx = x0 + (i + 0.5) * w
+        cy = (y0 + y1) / 2.0
+        m.box((cx, cy, 1.4), (w - 0.1, 6.0, 2.8))
+        m.box((cx, cy - 0.25, 2.95), (w + 0.2, 6.5, 0.18), rx=-0.07)
+        # porta metalica (aberta ou entreaberta)
+        a = rng.choice([0.0, 0.0, 0.5, 1.2])
+        m.box((cx, y0 - 0.04, 1.15), (w - 0.6, 0.08, 2.3)) if a == 0.0 else \
+            m.box((cx - (w - 0.6) / 2.0 + cos(a) * (w - 0.6) / 2.0, y0 - sin(a) * (w - 0.6) / 2.0, 1.15),
+                  (w - 0.6, 0.08, 2.3), yaw=-a)
+        m.box((cx, y0 - 0.02, 2.5), (w - 0.2, 0.15, 0.5))
+        for k in range(3):
+            m.box((cx, y0 - 0.1, 0.5 + k * 0.7), (w - 0.8, 0.03, 0.06)) if a == 0.0 else None
+    m.objeto("EDIFICIOS", "predio", 0.02)
+
+
+def pequenas_estruturas():
+    rng = random.Random(SEED + 9)
+    m = Malha("Pontos_Onibus_e_Guaritas")
+    # pontos de onibus
+    for (x, y, rot) in ((-48.0, 7.2, 0.0), (20.0, -7.2, pi), (35.8 + 3.0, -25.0, pi / 2)):
+        m.push(Matrix.Translation((x, y, Z_CAL)) @ Matrix.Rotation(rot, 4, 'Z'))
+        for sx in (-1.8, 1.8):
+            m.box((sx, 0, 1.2), (0.15, 0.15, 2.4))
+        m.box((0, 0, 2.5), (4.2, 1.6, 0.14), rx=0.04)
+        m.box((0, 0.7, 1.3), (3.6, 0.06, 2.0))
+        m.box((0, 0.5, 0.45), (3.0, 0.5, 0.08))
+        for sx in (-1.4, 1.4):
+            m.box((sx, 0.5, 0.2), (0.1, 0.4, 0.4))
+        m.pop()
+    # guarita de seguranca no portao da usina e cabine de transformador
+    m.push(Matrix.Translation((26.0, 47.0, 0.0)))
+    m.box((0, 0, 1.3), (2.6, 2.6, 2.6))
+    m.box((0, 0, 2.7), (3.2, 3.2, 0.15))
+    m.box((0, -1.32, 1.5), (1.6, 0.06, 1.1))
+    m.box((0.5, -1.35, 0.6), (0.9, 0.06, 1.2), yaw=-0.7)
+    m.pop()
+    m.push(Matrix.Translation((8.0, 36.0, 0.0)))
+    m.box((0, 0, 1.4), (3.0, 2.2, 2.8))
+    m.box((0, 0, 2.9), (3.3, 2.5, 0.2))
+    for k in range(5):
+        m.box((0, -1.12, 0.8 + k * 0.3), (2.0, 0.05, 0.12))
+    for sx in (-1, 1):
+        m.cil((sx * 0.8, 0, 3.35), 0.1, 0.9, seg=8)
+        m.cil((sx * 0.8, 0, 3.8), 0.17, 0.2, seg=8)
+    m.pop()
+    # bueiros e grades de drenagem nas laterais das ruas
+    for k in range(18):
+        v = rng.choice(VIAS)
+        h = v['l'] / 2.0 - 0.45
+        t = rng.uniform(-60, 60)
+        sg = rng.choice([-1, 1])
+        x, y = (t, v['c'] + sg * h) if v['eixo'] == 'x' else (v['c'] + sg * h, t * 0.9 - 15)
+        if abs(x) < 10 and abs(y) < 10:
+            continue
+        m.box((x, y, Z_VIA - 0.05), (0.7, 0.45, 0.12))
+        for q in range(4):
+            m.box((x, y, Z_VIA + 0.005), (0.04, 0.4, 0.02)) if False else None
+    m.objeto("EDIFICIOS", "predio", 0.015)
+
+
+# ----------------------------------------------------------------------------
+# USINA NUCLEAR (canto nordeste): patio, galpoes, bloco do reator 4 com
+# estrutura de contencao em arco, chamine, torre de resfriamento, tanques, tubulacoes
+# ----------------------------------------------------------------------------
+def galpao(m, rng, cx, cy, sx, sy, h, nbaias, rotulo=""):
+    """Galpao industrial de estrutura metalica com paineis (alguns faltando)."""
+    bw = sx / nbaias
+    for i in range(nbaias + 1):
+        x = cx - sx / 2.0 + i * bw
+        for sg in (-1, 1):
+            m.box((x, cy + sg * sy / 2.0, h / 2.0), (0.4, 0.4, h))
+        m.barra((x, cy - sy / 2.0, h), (x, cy, h + 1.6), 0.3, 0.3)
+        m.barra((x, cy + sy / 2.0, h), (x, cy, h + 1.6), 0.3, 0.3)
+        m.barra((x, cy - sy / 2.0, h), (x, cy + sy / 2.0, h), 0.25, 0.25)
+        m.barra((x, cy - sy / 4.0, h + 0.8), (x, cy, h + 0.1), 0.15, 0.15)
+        m.barra((x, cy + sy / 4.0, h + 0.8), (x, cy, h + 0.1), 0.15, 0.15)
+    m.box((cx, cy, 0.2), (sx, sy, 0.4))
+    for sg in (-1, 1):
+        m.box((cx, cy + sg * sy / 2.0, 1.6), (sx, 0.3, 3.2))              # soco de concreto
+        for i in range(nbaias):
+            for k in range(3):
+                if rng.random() < 0.12:
+                    continue
+                x = cx - sx / 2.0 + (i + 0.5) * bw
+                m.box((x, cy + sg * sy / 2.0, 3.6 + k * (h - 3.4) / 3.0 + (h - 3.4) / 6.0),
+                      (bw - 0.12, 0.08, (h - 3.4) / 3.0 - 0.1))
+        for q in range(2):
+            m.box((cx, cy + sg * (sy / 2.0 - q * 0.0), h + 0.8 + 0.4 * (1 - q)), (sx, 0.05, 0.2)) if False else None
+    for sg in (-1, 1):                                                     # telhado em duas aguas
+        for i in range(nbaias):
+            if rng.random() < 0.10:
+                continue
+            x = cx - sx / 2.0 + (i + 0.5) * bw
+            m.box((x, cy + sg * sy / 4.0, h + 0.9), (bw - 0.1, sy / 2.0 + 0.2, 0.08), rx=sg * 0.2)
+    for sg in (-1, 1):
+        m.box((cx - sx / 2.0, cy + sg * 0.0, h / 2.0 + 1.0), (0.2, sy, h + 2.0)) if False else None
+    m.box((cx - sx / 2.0, cy, h / 2.0 + 0.5), (0.3, sy, h + 1.0))
+    # portao grande de correr (aberto) + lampadas externas
+    m.box((cx + sx / 2.0, cy, 2.6), (0.3, 4.6, 5.2))
+    m.box((cx + sx / 2.0 + 0.2, cy - 2.4, 2.4), (0.08, 3.4, 4.8))
+    for i in range(0, nbaias, 2):
+        x = cx - sx / 2.0 + (i + 0.5) * bw
+        m.cil((x, cy - sy / 2.0 - 0.3, 3.4), 0.12, 0.3, (0, 1, 0), seg=8)
+
+
+def plano_arco(m, cx, cy, comp, vao, alt, nx=12, na=18):
+    """Casca de arco (contencao) com nervuras. Eixo longitudinal = X."""
+    pts = [(vao / 2.0 * cos(pi * k / na), alt * sin(pi * k / na)) for k in range(na + 1)]
+    pts = [(-vao / 2.0 * cos(pi * k / na) * -1.0, z) for k, (_, z) in enumerate(pts)]
+    anel = []
+    for i in range(nx + 1):
+        x = cx - comp / 2.0 + i * comp / nx
+        anel.append([m.bm.verts.new(m.base @ Vector((x, cy + yy, z))) for (yy, z) in pts])
+    for i in range(nx):
+        for k in range(na):
+            for esp, off in ((0, 0.0),):
+                m._face(anel[i] + anel[i + 1], (k, k + 1, na + 1 + k + 1, na + 1 + k))
+    # nervuras e treliças
+    for i in range(nx + 1):
+        x = cx - comp / 2.0 + i * comp / nx
+        for k in range(na):
+            m.barra((x, cy + pts[k][0], pts[k][1] + 0.02), (x, cy + pts[k + 1][0], pts[k + 1][1] + 0.02), 0.35, 0.5)
+            m.barra((x, cy + pts[k][0] * 0.94, pts[k][1] * 0.94 - 0.4), (x, cy + pts[k + 1][0] * 0.94, pts[k + 1][1] * 0.94 - 0.4), 0.18, 0.18)
+            if k % 2 == 0:
+                m.barra((x, cy + pts[k][0], pts[k][1]), (x, cy + pts[k + 1][0] * 0.94, pts[k + 1][1] * 0.94 - 0.4), 0.12, 0.12)
+    for k in range(0, na + 1, 3):
+        m.barra((cx - comp / 2.0, cy + pts[k][0], pts[k][1] + 0.3), (cx + comp / 2.0, cy + pts[k][0], pts[k][1] + 0.3), 0.25, 0.25)
+
+
+def torre_trelica(m, x, y, h, wb, wt, secoes, r=0.07):
+    for k in range(secoes):
+        z0, z1 = h * k / secoes, h * (k + 1) / secoes
+        w0 = wb + (wt - wb) * k / secoes
+        w1 = wb + (wt - wb) * (k + 1) / secoes
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                m.tubo((x + sx * w0 / 2, y + sy * w0 / 2, z0), (x + sx * w1 / 2, y + sy * w1 / 2, z1), r, 6)
+        for sg in (-1, 1):
+            m.tubo((x - w0 / 2, y + sg * w0 / 2, z0), (x + w1 / 2, y + sg * w1 / 2, z1), r * 0.55, 5)
+            m.tubo((x + sg * w0 / 2, y - w0 / 2, z0), (x + sg * w1 / 2, y + w1 / 2, z1), r * 0.55, 5)
+        m.tubo((x - w1 / 2, y - w1 / 2, z1), (x + w1 / 2, y - w1 / 2, z1), r * 0.5, 5)
+        m.tubo((x - w1 / 2, y + w1 / 2, z1), (x + w1 / 2, y + w1 / 2, z1), r * 0.5, 5)
+        m.tubo((x - w1 / 2, y - w1 / 2, z1), (x - w1 / 2, y + w1 / 2, z1), r * 0.5, 5)
+        m.tubo((x + w1 / 2, y - w1 / 2, z1), (x + w1 / 2, y + w1 / 2, z1), r * 0.5, 5)
+
+
+def tanque(m, x, y, r, h):
+    m.cil((x, y, h / 2.0), r, h, seg=24)
+    for k in range(1, 4):
+        m.cil((x, y, h * k / 4.0), r * 1.02, 0.12, seg=24)
+    m.cil((x, y, h + 0.35), r * 0.55, 0.7, seg=24, r2=r * 0.2)
+    m.cil((x, y, 0.2), r * 1.12, 0.4, seg=24)
+    # escada helicoidal simplificada e passarela
+    for k in range(10):
+        a = 0.4 + k * 0.28
+        m.box((x + cos(a) * (r + 0.35), y + sin(a) * (r + 0.35), 0.4 + k * h / 11.0),
+              (0.7, 0.45, 0.06), yaw=a + pi / 2)
+    m.tubo((x + r * 0.9, y, h + 0.1), (x + r * 3.0, y, h * 0.55), 0.10, 8)
+
+
+def guindaste(m, x, y, h, jib, rng):
+    torre_trelica(m, x, y, h, 1.8, 1.4, 12, 0.07)
+    m.box((x, y, h + 0.7), (1.8, 1.8, 1.4))                      # cabine
+    m.box((x + 0.95, y, h + 0.9), (0.15, 1.2, 0.8))
+    m.barra((x - 7.0, y, h + 1.5), (x + jib, y, h + 1.5), 0.6, 0.6)
+    for k in range(6):
+        xx = x - 7.0 + k * (jib + 7.0) / 5.0
+        m.barra((xx, y, h + 1.5), (xx, y, h + 4.0), 0.1, 0.1)
+    m.tubo((x, y, h + 4.8), (x - 7.0, y, h + 1.6), 0.04, 5)
+    m.tubo((x, y, h + 4.8), (x + jib, y, h + 1.6), 0.04, 5)
+    m.box((x - 6.0, y, h + 0.9), (2.0, 1.6, 1.4))                # contrapeso
+    m.tubo((x + jib * 0.8, y, h + 1.0), (x + jib * 0.8, y, h - 12.0), 0.02, 4)
+    m.box((x + jib * 0.8, y, h - 12.4), (0.5, 0.3, 0.8))
+
+
+def usina():
+    rng = random.Random(SEED + 11)
+    # patio de concreto (lajes)
+    pat = Malha("Usina_Patio")
+    x0, x1, y0, y1 = RET_USINA
+    lajes(pat, (x0, x1, y0, y1), 4.0, 4.0, Z_VIA, ESP_LAJE_, rng, 0.0, 0.18, 0.06, 0.08)
+    pat.objeto("USINA_NUCLEAR", "concreto", 0.012)
+
+    m = Malha("Usina_Estruturas")
+    # galpoes e sala de turbinas
+    galpao(m, rng, 37.0, 55.0, 22.0, 12.0, 14.0, 11)
+    m.objeto("USINA_NUCLEAR", "usina", 0.04)
+    g = Malha("Usina_Galpoes_Externos")
+    galpao(g, rng, 51.0, 29.5, 14.0, 8.0, 6.0, 6)
+    galpao(g, rng, 67.0, 29.5, 14.0, 8.0, 6.0, 6)
+    g.objeto("USINA_NUCLEAR", "usina", 0.03)
+
+    # bloco do reator 4 (volume macico) + chamine ventilacao
+    b = Malha("Usina_Bloco_Reator4")
+    b.box((37.0, 67.5, 12.0), (16.0, 9.0, 24.0))
+    b.box((37.0, 67.5, 24.4), (16.5, 9.5, 0.8))
+    for k in range(5):
+        b.box((37.0, 62.9, 3.0 + k * 4.2), (16.2, 0.2, 0.4))
+    for i in range(7):
+        for k in range(3):
+            if rng.random() < 0.8:
+                b.box((30.0 + i * 2.2, 62.9, 6.0 + k * 6.5), (1.0, 0.2, 2.4))
+    b.box((37.0, 67.5, 27.0), (6.0, 5.0, 4.0))
+    for sx in (-1, 1):
+        b.box((37.0 + sx * 9.0, 67.5, 8.0), (2.0, 5.0, 16.0))
+        b.cil((37.0 + sx * 6.0, 62.2, 15.0), 0.9, 6.0, (0, 1, 0), seg=14)
+    b.cabo([(46.0, 66.0, 18.0), (49.0, 66.0, 18.0), (49.0, 62.0, 9.0)], 0.7, 12, True)
+    b.objeto("USINA_NUCLEAR", "usina", 0.05)
+
+    c = Malha("Usina_Chamine")
+    perfil = [(2.4, 0.0), (2.2, 8.0), (1.95, 16.0), (1.7, 26.0), (1.45, 36.0), (1.25, 46.0)]
+    c.push(Matrix.Translation((26.0, 69.0, 0.0)))
+    c.lathe(perfil, 24, 0.35)
+    for k in range(1, 8):
+        z = 6.0 * k
+        c.cil((0, 0, z), 2.4 - 0.025 * z, 0.5, seg=24)
+    for sx in (-1, 1):
+        c.tubo((sx * 2.4, 0, 0.5), (sx * 1.8, 0, 38.0), 0.06, 4)
+    c.cil((0, 0, 46.3), 1.5, 0.5, seg=24)
+    c.pop()
+    c.cabo([(26.0, 69.0, 9.0), (26.0, 62.0, 9.0), (49.0, 62.0, 9.0)], 0.8, 14, True)
+    for x in (30.0, 36.0, 42.0, 48.0):
+        c.box((x, 62.0, 4.2), (0.7, 0.7, 8.4))
+        c.box((x, 62.0, 8.3), (0.8, 2.4, 0.25))
+    c.objeto("USINA_NUCLEAR", "usina", 0.04)
+
+    # torre de resfriamento
+    t = Malha("Usina_Torre_Resfriamento")
+    t.push(Matrix.Translation((14.0, 66.0, 0.0)))
+    per = []
+    for k in range(14):
+        z = 4.0 + k * 1.9
+        r = 4.6 * sqrt(1.0 + ((z - 18.0) / 15.0) ** 2) * 1.05
+        per.append((r, z))
+    for a in range(24):
+        ang = 2 * pi * a / 24
+        r0 = per[0][0] * 1.1
+        t.tubo((r0 * cos(ang), r0 * sin(ang), 0.0), (per[0][0] * cos(ang + 0.13), per[0][0] * sin(ang + 0.13), 4.0), 0.14, 6)
+        t.tubo((r0 * cos(ang), r0 * sin(ang), 0.0), (per[0][0] * cos(ang - 0.13), per[0][0] * sin(ang - 0.13), 4.0), 0.14, 6)
+    t.lathe(per, 28, 0.35)
+    t.cil((0, 0, 4.0), per[0][0], 0.3, seg=28, tampas=False)
+    t.pop()
+    t.objeto("USINA_NUCLEAR", "usina", 0.04)
+
+    # estrutura de contencao (arco) sobre o reator 4
+    a = Malha("Usina_Contencao_Reator4")
+    plano_arco(a, 62.0, 63.0, 24.0, 22.0, 20.0, 12, 18)
+    a.box((50.0, 63.0, 5.0), (0.4, 22.0, 10.0))
+    a.box((74.0, 63.0, 4.0), (0.6, 22.0, 8.0))
+    a.box((62.0, 63.0, 0.4), (24.0, 22.0, 0.8))
+    a.cil((62.0, 52.5, 3.5), 1.4, 7.0, seg=16)
+    a.objeto("USINA_NUCLEAR", "usina", 0.04)
+
+    # tanques e tubulacoes
+    k = Malha("Usina_Tanques_Tubulacoes")
+    for (x, y) in ((25.0, 48.6), (42.0, 48.6), (47.5, 48.6)):
+        tanque(k, x, y, 2.6, 8.0)
+    for x in (24.0, 28.0, 38.0, 44.0, 49.0):
+        k.box((x, 51.0, 2.7), (0.35, 0.35, 5.4))
+        k.box((x, 51.0, 5.45), (0.4, 2.0, 0.25))
+    for dy in (-0.5, 0.0, 0.5):
+        k.cabo([(24.0, 51.0 + dy, 5.9), (49.0, 51.0 + dy, 5.9)], 0.22, 10)
+    k.cabo([(25.0, 48.6, 8.0), (25.0, 51.0, 8.0), (25.0, 51.0, 6.1)], 0.18, 10, True)
+    for (tx, ty) in ((24.0, 57.0), (72.0, 47.5)):
+        torre_trelica(k, tx, ty, 32.0 if tx < 30 else 26.0, 3.0, 1.0, 10)
+    guindaste(k, 47.0, 66.0, 38.0, 20.0, rng)
+    # estrutura metalica com passarela entre o bloco e a sala de turbinas
+    k.box((37.0, 61.8, 13.5), (18.0, 1.2, 0.2))
+    k.objeto("USINA_NUCLEAR", "usina", 0.04)
+
+
+# ----------------------------------------------------------------------------
+# VEGETACAO (malhas compartilhadas, instanciadas com distribuicao irregular)
+# ----------------------------------------------------------------------------
+def malha_arvore(seed, altura, folhas, nome):
+    rng = random.Random(seed)
+    m = Malha(nome)
+
+    def ramo(p, d, r, comp, nivel):
+        p2 = p + d * comp
+        m.tubo(p, p2, r, 6, r * 0.65)
+        if nivel <= 0 or comp < 0.45:
+            if rng.random() < folhas:
+                m.esfera(p2, rng.uniform(0.5, 1.1), (1, 1, 0.6), 0.25, rng)
+            return
+        for _ in range(rng.randint(2, 3)):
+            nd = (d + Vector((rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-0.1, 0.8)))).normalized()
+            ramo(p2, nd, r * 0.6, comp * rng.uniform(0.55, 0.8), nivel - 1)
+        nd = (d + Vector((rng.uniform(-0.25, 0.25), rng.uniform(-0.25, 0.25), 0.1))).normalized()
+        ramo(p2, nd, r * 0.78, comp * 0.8, nivel - 1)
+
+    tr = altura * 0.45
+    tilt = Vector((rng.uniform(-0.12, 0.12), rng.uniform(-0.12, 0.12), 1.0)).normalized()
+    m.tubo((0, 0, -0.2), tilt * tr, 0.22, 8, 0.15)
+    for k in range(3):                                   # galhos baixos secos
+        a = rng.uniform(0, 2 * pi)
+        base = tilt * (tr * (0.35 + 0.2 * k))
+        d = Vector((cos(a), sin(a), rng.uniform(0.2, 0.7))).normalized()
+        ramo(base, d, 0.07, altura * 0.18, 2)
+    ramo(tilt * tr, tilt, 0.15, altura * 0.28, 4)
+    return m.mesh("veg", 0.0)
+
+
+def malha_pinheiro(seed, altura, nome):
+    rng = random.Random(seed)
+    m = Malha(nome)
+    m.cil((0, 0, altura * 0.4), 0.16, altura * 0.8, seg=8, r2=0.07)
+    n = 7
+    for k in range(n):
+        z = altura * (0.25 + 0.75 * k / n)
+        r = 1.9 * (1 - k / (n + 1.0)) * rng.uniform(0.8, 1.1)
+        if rng.random() < 0.15:
+            continue
+        m.cil((rng.uniform(-0.1, 0.1), rng.uniform(-0.1, 0.1), z), r, 0.9, seg=9, r2=0.1)
+    return m.mesh("veg", 0.0)
+
+
+def malha_arbusto(seed, nome):
+    rng = random.Random(seed)
+    m = Malha(nome)
+    for _ in range(rng.randint(4, 7)):
+        m.esfera((rng.uniform(-0.6, 0.6), rng.uniform(-0.6, 0.6), rng.uniform(0.25, 0.6)), rng.uniform(0.35, 0.65),
+                 (1, 1, 0.8), 0.3, rng)
+    for _ in range(5):
+        a = rng.uniform(0, 2 * pi)
+        m.tubo((0, 0, 0), (cos(a) * 0.8, sin(a) * 0.8, rng.uniform(0.6, 1.1)), 0.02, 4, 0.01)
+    return m.mesh("veg", 0.0)
+
+
+def malha_capim(seed, altura, n, nome, raio=0.25):
+    rng = random.Random(seed)
+    m = Malha(nome)
+    for _ in range(n):
+        a = rng.uniform(0, 2 * pi)
+        d = rng.uniform(0, raio)
+        x, y = cos(a) * d, sin(a) * d
+        h = altura * rng.uniform(0.5, 1.0)
+        b = rng.uniform(0, 2 * pi)
+        dx, dy = cos(b) * h * 0.35, sin(b) * h * 0.35
+        w = 0.015 + altura * 0.015
+        px, py = -sin(b) * w, cos(b) * w
+        m.lamina([(x - px, y - py, 0), (x + px, y + py, 0),
+                  (x + px * 0.6 + dx * 0.5, y + py * 0.6 + dy * 0.5, h * 0.6),
+                  (x + dx, y + dy, h)])
+    return m.mesh("veg", 0.0)
+
+
+def malha_raiz(seed, nome):
+    rng = random.Random(seed)
+    m = Malha(nome)
+    for k in range(5):
+        a = k * 2 * pi / 5 + rng.uniform(-0.3, 0.3)
+        p = Vector((0, 0, 0.18))
+        d = Vector((cos(a), sin(a), 0))
+        r = 0.11
+        for s in range(5):
+            q = p + d * rng.uniform(0.35, 0.6)
+            q.z = max(0.02, 0.18 - s * 0.04)
+            m.tubo(p, q, r, 6, r * 0.7)
+            p, r = q, r * 0.7
+            d = (d + Vector((rng.uniform(-0.4, 0.4), rng.uniform(-0.4, 0.4), 0))).normalized()
+    return m.mesh("veg", 0.0)
+
+
+def vegetacao():
+    rng = random.Random(SEED + 21)
+    arv = [malha_arvore(100 + i, rng.uniform(5.5, 9.0), f, "Arvore_%d" % i)
+           for i, f in enumerate((0.08, 0.15, 0.30, 0.35, 0.55, 0.6))]
+    pin = [malha_pinheiro(200 + i, rng.uniform(6.0, 10.0), "Pinheiro_%d" % i) for i in range(2)]
+    arb = [malha_arbusto(300 + i, "Arbusto_%d" % i) for i in range(3)]
+    cap_b = [malha_capim(400 + i, 0.35, 14, "Capim_%d" % i) for i in range(4)]
+    cap_a = [malha_capim(500 + i, 1.15, 22, "CapimAlto_%d" % i, 0.4) for i in range(3)]
+    raiz = [malha_raiz(600 + i, "Raiz_%d" % i) for i in range(3)]
+    bloq_arv = rects_bloqueio(2.0)
+    bloq_arb = rects_bloqueio(0.8)
+    bloq_cap = rects_bloqueio(0.0)
+    cont = 0
+
+    def aleatorio(bloq, margem_borda=2.0):
+        for _ in range(60):
+            x = rng.uniform(-MET + margem_borda, MET - margem_borda)
+            y = rng.uniform(-MET + margem_borda, MET - margem_borda)
+            if not bloqueado(x, y, bloq):
+                return x, y
+        return None
+
+    # arvores: agrupadas (bosques irregulares) + isoladas
+    centros = [(rng.uniform(-70, 70), rng.uniform(-70, 70)) for _ in range(14)]
+    for k in range(170):
+        if k < 110:
+            cx, cy = rng.choice(centros)
+            x, y = cx + rng.gauss(0, 7.0), cy + rng.gauss(0, 7.0)
+            if abs(x) > MET - 2 or abs(y) > MET - 2 or bloqueado(x, y, bloq_arv):
+                continue
+        else:
+            p = aleatorio(bloq_arv)
+            if not p:
+                continue
+            x, y = p
+        esc = rng.uniform(0.75, 1.35)
+        me = rng.choice(pin) if rng.random() < 0.22 else rng.choice(arv)
+        instancia("Arvore", me, "VEGETACAO", (x, y, alt(x, y)), (0, 0, rng.uniform(0, 2 * pi)), esc)
+        cont += 1
+        if rng.random() < 0.6:
+            instancia("Raiz", rng.choice(raiz), "VEGETACAO", (x, y, alt(x, y) - 0.02), (0, 0, rng.uniform(0, 2 * pi)), esc * 1.2)
+        for _ in range(rng.randint(0, 3)):
+            qx, qy = x + rng.gauss(0, 1.5), y + rng.gauss(0, 1.5)
+            if not bloqueado(qx, qy, bloq_cap):
+                instancia("Capim", rng.choice(cap_a), "VEGETACAO", (qx, qy, alt(qx, qy)), (0, 0, rng.uniform(0, 6.28)), rng.uniform(0.8, 1.3))
+    for _ in range(260):
+        p = aleatorio(bloq_arb)
+        if p:
+            x, y = p
+            instancia("Arbusto", rng.choice(arb), "VEGETACAO", (x, y, alt(x, y) - 0.05),
+                      (0, 0, rng.uniform(0, 6.28)), rng.uniform(0.7, 1.4))
+    for _ in range(520):
+        p = aleatorio(bloq_cap, 0.5)
+        if p:
+            x, y = p
+            me = rng.choice(cap_a) if rng.random() < 0.35 else rng.choice(cap_b)
+            instancia("Capim", me, "VEGETACAO", (x, y, alt(x, y)), (0, 0, rng.uniform(0, 6.28)), rng.uniform(0.8, 1.4))
+    # plantas crescendo nas rachaduras das ruas e calcadas
+    for _ in range(420):
+        v = rng.choice(VIAS)
+        h = v['l'] / 2.0
+        t = rng.uniform(v['a'] + 1, v['b'] - 1)
+        if rng.random() < 0.55:
+            off = rng.choice([-1, 1]) * (h - rng.uniform(0.05, 0.6))
+            z = Z_VIA
+        else:
+            off = rng.choice([-1, 1]) * (h + rng.uniform(0.2, CAL_L - 0.2))
+            z = Z_CAL
+        x, y = (t, v['c'] + off) if v['eixo'] == 'x' else (v['c'] + off, t)
+        if dentro(x, y, LIVRE_INICIAL):
+            continue
+        instancia("Erva", rng.choice(cap_b), "VEGETACAO", (x, y, z), (0, 0, rng.uniform(0, 6.28)), rng.uniform(0.5, 1.0))
+    # vegetacao junto das fundacoes dos predios
+    for p in PREDIOS:
+        _, _, cx, cy, yaw, L, W, _, _, _ = p
+        for _ in range(26):
+            lado = rng.choice([-1, 1])
+            lx, ly = rng.uniform(-L / 2.0, L / 2.0), lado * (W / 2.0 + rng.uniform(0.6, 2.2))
+            x = cx + lx * cos(yaw) - ly * sin(yaw)
+            y = cy + lx * sin(yaw) + ly * cos(yaw)
+            if dentro(x, y, LIVRE_INICIAL) or any(dentro(x, y, ret_via(v), CAL_L) for v in VIAS):
+                continue
+            if rng.random() < 0.5:
+                instancia("Arbusto", rng.choice(arb), "VEGETACAO", (x, y, alt(x, y)), (0, 0, rng.uniform(0, 6.28)), rng.uniform(0.5, 0.9))
+            else:
+                instancia("Capim", rng.choice(cap_a), "VEGETACAO", (x, y, alt(x, y)), (0, 0, rng.uniform(0, 6.28)), 1.0)
+    return cont
+
+
+# ----------------------------------------------------------------------------
+# VEICULOS SOVIETICOS DEGRADADOS (malhas compartilhadas, instanciadas)
+# ----------------------------------------------------------------------------
+def roda(m, c, r, w, murcha=1.0, lugs=False):
+    Y = (0, 1, 0)
+    rr = r * murcha
+    cz = c[2] - (r - rr)
+    m.cil((c[0], c[1], cz), rr, w, Y, seg=18)
+    m.cil((c[0], c[1], cz), rr * 0.62, w * 1.04, Y, seg=14)
+    m.cil((c[0], c[1], cz), rr * 0.22, w * 1.12, Y, seg=10)
+    if lugs:
+        for k in range(14):
+            a = 2 * pi * k / 14
+            m.box((c[0] + cos(a) * rr, c[1], cz + sin(a) * rr), (0.12, w * 0.95, 0.06), ry=-a)
+    for k in range(5):
+        a = 2 * pi * k / 5
+        m.cil((c[0] + cos(a) * rr * 0.4, c[1] + (w / 2.0 + 0.02) * (1 if c[1] > 0 else -1), cz + sin(a) * rr * 0.4),
+              0.02, 0.04, Y, seg=6)
+
+
+def far(m, p, d=(1, 0, 0), r=0.09):
+    m.cil(p, r, 0.06, d, seg=12)
+    m.cil(Vector(p) + Vector(d) * 0.03, r * 0.7, 0.04, d, seg=12)
+
+
+def sedan(nome, perua=False):
+    m = Malha(nome)
+    L, W = 4.1, 1.6
+    m.box((0, 0, 0.55), (L, W, 0.5))
+    m.box((0.95, 0, 0.88), (1.5, W - 0.05, 0.16))                   # capo
+    m.box((-1.15, 0, 0.88), (1.1, W - 0.05, 0.16))                  # porta-malas
+    cab = [(-1.0, 0.0), (-0.75, 0.52), (0.45, 0.52), (0.85, 0.0)] if not perua else \
+          [(-1.55, 0.0), (-1.45, 0.52), (0.45, 0.52), (0.85, 0.0)]
+    m.prisma([(x, z) for x, z in [(x + 0.1, z + 0.96) for x, z in cab]], -W / 2.0 + 0.1, W / 2.0 - 0.1, 'XZ')
+    m.box((0, 0, 1.5), (1.3 if not perua else 1.9, W - 0.2, 0.05), ry=0.0)
+    for sy in (-1, 1):                                              # colunas
+        for x in (-0.52, 0.52):
+            m.box((x - 0.05, sy * (W / 2.0 - 0.1), 1.2), (0.07, 0.07, 0.5), ry=0.0)
+        m.box((0.0, sy * (W / 2.0 + 0.005), 0.78), (3.6, 0.02, 0.03))
+        m.box((0.05, sy * (W / 2.0 + 0.01), 0.7), (0.03, 0.03, 0.55))
+        m.box((-0.8, sy * (W / 2.0 + 0.01), 0.7), (0.03, 0.03, 0.55))
+        m.box((0.4, sy * (W / 2.0 + 0.04), 0.85), (0.12, 0.03, 0.03))
+        m.box((-0.45, sy * (W / 2.0 + 0.04), 0.85), (0.12, 0.03, 0.03))
+        m.box((0.58, sy * (W / 2.0 + 0.1), 1.08), (0.15, 0.12, 0.09))
+    m.box((2.1, 0, 0.35), (0.12, W + 0.1, 0.16))
+    m.box((-2.1, 0, 0.35), (0.12, W + 0.1, 0.16))
+    for sy in (-1, 1):
+        far(m, (2.06, sy * 0.55, 0.65))
+        far(m, (-2.06, sy * 0.55, 0.65), (-1, 0, 0), 0.07)
+    for k in range(5):
+        m.box((2.05, 0, 0.58 + k * 0.03), (0.02, 0.6, 0.015))
+    # porta entreaberta e rodas (uma murcha)
+    m.box((-0.2, W / 2.0 + 0.35, 0.8), (0.8, 0.05, 0.6), yaw=0.8)
+    for (x, sy, mu) in ((1.3, 1, 1.0), (1.3, -1, 1.0), (-1.25, 1, 0.75), (-1.25, -1, 1.0)):
+        roda(m, (x, sy * (W / 2.0 - 0.1), 0.3), 0.3, 0.2, mu)
+    return m.mesh("veic_perua" if perua else "veic_sedan", 0.012)
+
+
+def van(nome):
+    m = Malha(nome)
+    L, W = 4.3, 1.9
+    m.box((0, 0, 0.62), (L, W, 0.6))
+    m.box((-0.2, 0, 1.45), (L - 0.9, W - 0.05, 1.2))
+    m.box((1.75, 0, 1.0), (0.8, W - 0.05, 0.9))
+    m.box((1.95, 0, 1.15), (0.1, W - 0.3, 0.5), ry=0.0)
+    for sy in (-1, 1):
+        for k in range(3):
+            m.box((-0.9 + k * 1.0, sy * (W / 2.0 - 0.02), 1.6), (0.7, 0.04, 0.5))
+        m.box((0.4, sy * (W / 2.0 + 0.02), 1.1), (0.04, 0.04, 1.0))
+        far(m, (2.14, sy * 0.6, 0.75))
+    m.box((-2.2, 0, 0.6), (0.1, W, 0.9))
+    m.box((2.25, 0, 0.42), (0.14, W + 0.1, 0.2))
+    m.box((-2.25, 0, 0.42), (0.14, W + 0.1, 0.2))
+    m.box((-0.2, 0, 2.08), (L - 1.2, W - 0.3, 0.07))
+    m.box((-2.3, 0, 1.0), (0.04, 0.9, 1.0), yaw=1.0)           # porta traseira
+    for (x, sy) in ((1.35, 1), (1.35, -1), (-1.35, 1), (-1.35, -1)):
+        roda(m, (x, sy * (W / 2.0 - 0.12), 0.34), 0.34, 0.22, 0.8 if (x < 0 and sy > 0) else 1.0)
+    return m.mesh("veic_van", 0.012)
+
+
+def caminhao(nome, basculante=False):
+    m = Malha(nome)
+    L, W = 6.2, 2.3
+    m.box((0, 0, 0.8), (L, 1.0, 0.25))                                  # chassi
+    m.box((2.0, 0, 1.55), (1.7, W - 0.1, 1.5))                          # cabine
+    m.box((2.0, 0, 2.35), (1.8, W - 0.05, 0.09))
+    m.box((3.1, 0, 1.2), (1.0, W - 0.2, 0.9))                           # capo
+    m.box((3.65, 0, 1.2), (0.12, W - 0.5, 0.65))
+    for sy in (-1, 1):
+        m.box((2.3, sy * (W / 2.0 - 0.02), 1.85), (0.9, 0.04, 0.55))
+        m.box((1.2, sy * (W / 2.0 - 0.02), 1.0), (0.06, 0.06, 0.5))
+        m.box((2.9, sy * (W / 2.0 + 0.05), 0.6), (0.9, 0.2, 0.06))
+        far(m, (3.72, sy * 0.7, 1.2), (1, 0, 0), 0.1)
+        m.cil((-0.6, sy * 1.05, 0.62), 0.28, 0.9, (1, 0, 0), seg=12)       # tanque
+        m.box((3.8, sy * 0.9, 0.55), (0.2, 0.5, 0.12))
+    m.box((3.85, 0, 0.5), (0.2, W + 0.1, 0.2))
+    if not basculante:
+        m.box((-1.15, 0, 1.0), (3.6, W, 0.15))                           # carroceria
+        for sy in (-1, 1):
+            m.box((-1.15, sy * (W / 2.0 - 0.04), 1.5), (3.6, 0.08, 0.9), rx=sy * 0.04)
+        m.box((-2.9, 0, 1.45), (0.08, W, 0.8), rx=0.0)
+        m.box((0.6, 0, 1.45), (0.08, W, 0.8))
+        for k in range(6):
+            m.box((-2.8 + k * 0.62, 0, 1.15), (0.1, W + 0.04, 0.06))
+        m.box((-1.15, 0.0, 1.14), (3.4, 0.08, 0.04))
+    else:
+        m.push(Matrix.Translation((-2.6, 0, 1.0)) @ Matrix.Rotation(-0.32, 4, 'Y'))
+        m.box((1.7, 0, 0.1), (3.6, W - 0.1, 0.12))
+        for sy in (-1, 1):
+            m.box((1.7, sy * (W / 2.0 - 0.1), 0.65), (3.6, 0.1, 1.1))
+        m.box((3.4, 0, 0.7), (0.1, W - 0.2, 1.2))
+        m.box((0.0, 0, 0.7), (0.1, W - 0.2, 1.2))
+        m.pop()
+        m.tubo((-0.4, 0, 0.9), (-1.4, 0, 1.9), 0.09, 8)
+        m.tubo((-0.4, 0, 0.9), (-0.9, 0, 1.4), 0.12, 8)
+    for (x, sy) in ((2.3, 1), (2.3, -1), (-0.9, 1), (-0.9, -1), (-2.2, 1), (-2.2, -1)):
+        roda(m, (x, sy * (W / 2.0 - 0.16), 0.5), 0.5, 0.3, 1.0 if not (x == -2.2 and sy < 0) else 0.8, True)
+    return m.mesh("veic_dump" if basculante else "veic_truck", 0.015)
+
+
+def onibus(nome):
+    m = Malha(nome)
+    L, W, H = 11.0, 2.5, 3.0
+    m.box((0, 0, 0.9), (L, W, 1.0))                                     # saia
+    m.box((0, 0, H - 0.1), (L, W - 0.05, 0.2))                          # teto
+    for sy in (-1, 1):
+        for i in range(11):
+            x = -L / 2.0 + 0.25 + i * (L - 0.5) / 10.0
+            m.box((x, sy * (W / 2.0 - 0.05), 2.0), (0.1, 0.1, 1.2))      # pilares das janelas
+            if (i == 6 and sy == 1):
+                continue
+        m.box((0, sy * (W / 2.0 - 0.05), 2.6), (L, 0.1, 0.1))
+        m.box((0, sy * (W / 2.0 - 0.05), 1.5), (L, 0.1, 0.12))
+        for k in range(3):                                              # vidros estilhacados
+            m.box((-3.0 + k * 2.5, sy * (W / 2.0 - 0.05), 1.9), (0.5, 0.02, 0.35), rx=0.4)
+    m.box((L / 2.0 - 0.04, 0, 1.9), (0.08, W - 0.1, 1.6))               # frente
+    m.box((L / 2.0 + 0.02, 0, 0.75), (0.1, W, 0.2))
+    m.box((-L / 2.0 + 0.04, 0, 1.9), (0.08, W - 0.1, 1.6))
+    for sy in (-1, 1):
+        far(m, (L / 2.0 + 0.05, sy * 0.8, 0.9), (1, 0, 0), 0.12)
+    for x in (-2.5, 0.3):
+        m.box((x, 0, H + 0.05), (1.4, 1.0, 0.1))
+    m.box((3.0, W / 2.0 + 0.05, 1.3), (0.9, 0.06, 2.0), yaw=0.0)         # porta
+    m.box((3.5, W / 2.0 + 0.45, 1.3), (0.9, 0.06, 2.0), yaw=0.9)
+    # bancos visiveis
+    for i in range(6):
+        for sy in (-0.6, 0.6):
+            m.box((-4.0 + i * 1.4, sy, 1.0), (0.45, 0.45, 0.5))
+            m.box((-4.2 + i * 1.4, sy, 1.35), (0.08, 0.45, 0.6))
+    for (x, sy) in ((3.7, 1), (3.7, -1), (-3.2, 1), (-3.2, -1)):
+        roda(m, (x, sy * (W / 2.0 - 0.14), 0.5), 0.5, 0.3, 0.7 if (x < 0 and sy < 0) else 1.0, True)
+    return m.mesh("veic_bus", 0.015)
+
+
+def trator(nome):
+    m = Malha(nome)
+    m.box((0.3, 0, 1.0), (2.4, 0.9, 0.5))
+    m.box((1.1, 0, 1.3), (1.3, 0.9, 0.7))
+    m.box((1.8, 0, 1.2), (0.15, 0.8, 0.5))
+    m.cil((1.5, 0.3, 2.05), 0.06, 1.0, seg=8)
+    m.cil((1.5, 0.3, 2.6), 0.1, 0.1, seg=8)
+    m.box((-0.8, 0, 1.55), (1.3, 1.6, 0.06))                              # cabine
+    for sx in (-1.4, -0.2):
+        for sy in (-1, 1):
+            m.box((sx, sy * 0.75, 1.15), (0.06, 0.06, 1.0))
+    m.box((-0.8, 0, 1.2), (1.1, 1.3, 0.12))
+    m.box((-0.8, 0.0, 1.45), (0.5, 0.5, 0.5))
+    for sy in (-1, 1):
+        roda(m, (-0.9, sy * 0.95, 0.8), 0.8, 0.45, 1.0, True)
+        roda(m, (1.4, sy * 0.75, 0.48), 0.48, 0.25, 1.0 if sy > 0 else 0.85, True)
+        m.box((-0.9, sy * 0.85, 1.65), (1.1, 0.55, 0.1))
+    m.tubo((-1.5, 0, 0.9), (-2.1, 0, 0.7), 0.06, 6)
+    return m.mesh("veic_trator", 0.015)
+
+
+def veiculos():
+    rng = random.Random(SEED + 31)
+    mesh = {
+        "sedan": sedan("Lada_Sedan"), "perua": sedan("Moskvich_Perua", True), "van": van("UAZ_Van"),
+        "truck": caminhao("GAZ_Caminhao"), "dump": caminhao("ZIL_Basculante", True),
+        "bus": onibus("Onibus_Ikarus"), "trator": trator("Trator_MTZ"),
+    }
+    # tipo, x, y, yaw  (rua: encostados nas laterais, deixando >= 4 m livres no meio)
+    L = [
+        ("sedan", -22.0, 2.9, 0.06), ("van", 18.0, -3.0, pi + 0.04), ("truck", -55.0, 3.0, 0.02),
+        ("perua", 44.0, 3.0, 3.1), ("bus", -62.0, -2.5, 0.02), ("sedan", 30.2, -22.0, pi / 2 + 0.05),
+        ("truck", 34.2, 14.0, -pi / 2 + 0.05), ("bus", 8.0, -37.9, 0.03), ("sedan", -30.0, -38.3, pi - 0.05),
+        ("dump", -48.0, 38.2, 0.0), ("van", 20.0, 41.5, pi + 0.1), ("perua", 62.0, 37.4, 0.1),
+        ("trator", 16.0, -20.0, 0.7), ("truck", 18.0, 21.0, -0.5), ("sedan", -62.0, 12.0, 0.4),
+        ("van", 60.0, -2.8, 0.0), ("dump", 52.0, 29.0, 1.6), ("trator", 40.0, 31.0, 2.2),
+        ("sedan", -8.0, 45.5, 0.2), ("truck", 70.0, -33.0, -0.4), ("perua", -20.0, -30.0, 1.1),
+    ]
+    for (t, x, y, yaw) in L:
+        on_road = any(dentro(x, y, ret_via(v)) for v in VIAS)
+        z = Z_VIA if on_road else alt(x, y)
+        if dentro(x, y, LIVRE_INICIAL, 3.0):
+            continue
+        instancia(t, mesh[t], "VEICULOS", (x, y, z + 0.02), (rng.uniform(-0.02, 0.02), rng.uniform(-0.02, 0.03), yaw))
+    return mesh
+
+
+# ----------------------------------------------------------------------------
+# DESTROCOS, BARRIS, CAIXAS (malhas compartilhadas)
+# ----------------------------------------------------------------------------
+def malhas_destrocos():
+    rng = random.Random(SEED + 41)
+    D = {"bloco": [], "laje": [], "pedra": [], "chapa": [], "tubo": [], "barril": [], "caixa": [], "pneu": [], "vergalhao": []}
+    for i in range(4):
+        m = Malha("BlocoConcreto_%d" % i)
+        s = (rng.uniform(0.5, 0.9), rng.uniform(0.4, 0.6), rng.uniform(0.3, 0.5))
+        m.box((0, 0, s[2] / 2), s)
+        m.box((s[0] * 0.3, 0, s[2] + 0.04), (0.2, 0.2, 0.08), yaw=rng.uniform(0, 3))
+        for k in range(2):
+            m.tubo((s[0] / 2, rng.uniform(-0.1, 0.1), s[2] * 0.6), (s[0] / 2 + 0.3, rng.uniform(-0.2, 0.2), s[2] * 0.7), 0.012, 5)
+        D["bloco"].append(m.mesh("entulho", 0.012))
+    for i in range(2):
+        m = Malha("LajeInclinada_%d" % i)
+        m.box((0, 0, 0.5), (2.4, 1.6, 0.18), ry=0.35 + 0.1 * i, rx=0.1)
+        m.box((0.9, 0.2, 0.15), (0.6, 0.5, 0.3))
+        m.box((-0.9, -0.3, 0.12), (0.5, 0.5, 0.25))
+        ferragens(m, rng, (-1.2, 0, 0.8), (-1, 0, 0.2), 6)
+        D["laje"].append(m.mesh("entulho", 0.012))
+    for i in range(4):
+        m = Malha("Entulho_%d" % i)
+        for _ in range(rng.randint(5, 9)):
+            m.esfera((rng.uniform(-0.6, 0.6), rng.uniform(-0.6, 0.6), rng.uniform(0.05, 0.2)), rng.uniform(0.12, 0.3),
+                     (1, 0.8, 0.6), 0.35, rng)
+        for _ in range(3):
+            s = rng.uniform(0.15, 0.4)
+            m.box((rng.uniform(-0.5, 0.5), rng.uniform(-0.5, 0.5), s * 0.3), (s, s * 0.7, s * 0.6), yaw=rng.uniform(0, 3), rx=0.3)
+        D["pedra"].append(m.mesh("entulho", 0.0))
+    for i in range(2):
+        m = Malha("ChapaMetalica_%d" % i)
+        m.box((0, 0, 0.12), (1.8, 1.1, 0.03), rx=0.18, ry=-0.1 * i)
+        m.box((0.5, 0.2, 0.04), (0.9, 0.6, 0.03), yaw=0.8)
+        D["chapa"].append(m.mesh("ferrugem", 0.006))
+    for i in range(2):
+        m = Malha("TuboCaido_%d" % i)
+        m.cil((0, 0, 0.25), 0.22, 3.2 + i, (1, 0.1, 0), seg=14)
+        m.cil((1.55 + i * 0.5, 0.15, 0.25), 0.28, 0.12, (1, 0.1, 0), seg=14)
+        m.cil((-1.55 - i * 0.5, -0.15, 0.25), 0.28, 0.12, (1, 0.1, 0), seg=14)
+        D["tubo"].append(m.mesh("ferrugem", 0.01))
+    for i, tomb in enumerate((False, True, False)):
+        m = Malha("Barril_%d" % i)
+        if not tomb:
+            m.cil((0, 0, 0.45), 0.29, 0.9, seg=16)
+            for z in (0.18, 0.45, 0.72):
+                m.cil((0, 0, z), 0.31, 0.04, seg=16)
+            m.cil((0, 0, 0.91), 0.25, 0.03, seg=16)
+            m.cil((0.12, 0.05, 0.94), 0.05, 0.03, seg=8)
+        else:
+            m.cil((0, 0, 0.29), 0.29, 0.9, (1, 0, 0), seg=16)
+            for x in (-0.27, 0.0, 0.27):
+                m.cil((x, 0, 0.29), 0.31, 0.04, (1, 0, 0), seg=16)
+        D["barril"].append(m.mesh("ferrugem", 0.008))
+    for i in range(3):
+        m = Malha("CaixaIndustrial_%d" % i)
+        s = (rng.uniform(0.6, 1.2), rng.uniform(0.5, 0.9), rng.uniform(0.4, 0.8))
+        m.box((0, 0, s[2] / 2), s)
+        m.box((0, 0, s[2] + 0.02), (s[0] + 0.06, s[1] + 0.06, 0.05))
+        for sx in (-1, 1):
+            m.box((sx * s[0] * 0.5, 0, s[2] * 0.5), (0.05, s[1] * 0.9, 0.05))
+        if i == 2:
+            m.box((0, 0, s[2] + 0.45), (s[0] * 0.6, s[1] * 0.6, 0.5))
+        D["caixa"].append(m.mesh("entulho", 0.008))
+    m = Malha("Pneu")
+    m.toro((0, 0, 0.14), 0.3, 0.13, (0, 1, 0.2), 18, 8)
+    D["pneu"].append(m.mesh("entulho", 0.0))
+    m = Malha("Vergalhoes")
+    for k in range(9):
+        m.tubo((k * 0.03, 0.02 * k, 0.02 + 0.03 * (k % 3)), (1.6 + 0.1 * k, 0.05 * k - 0.1, 0.03 + 0.03 * (k % 3)), 0.011, 5)
+    D["vergalhao"].append(m.mesh("ferrugem", 0.0))
+    return D
+
+
+def destrocos():
+    rng = random.Random(SEED + 42)
+    D = malhas_destrocos()
+    bloq_c = rects_bloqueio(0.0)
+    cnt = 0
+
+    def colocar(grupo, x, y, z=None, yaw=None, esc=1.0):
+        if dentro(x, y, LIVRE_INICIAL, 1.0):
+            return
+        zz = z if z is not None else alt(x, y)
+        instancia(grupo, rng.choice(D[grupo]), "DESTROCOS", (x, y, zz), (0, 0, rng.uniform(0, 6.28) if yaw is None else yaw), esc)
+
+    # ao longo das ruas: pequenos nas faixas, grandes so nas bordas
+    for _ in range(200):
+        v = rng.choice(VIAS)
+        t = rng.uniform(v['a'] + 2, v['b'] - 2)
+        h = v['l'] / 2.0
+        grande = rng.random() < 0.5
+        off = rng.choice([-1, 1]) * (h - (rng.uniform(0.3, 1.2) if grande else rng.uniform(0.2, h)))
+        x, y = (t, v['c'] + off) if v['eixo'] == 'x' else (v['c'] + off, t)
+        g = rng.choice(["bloco", "pedra", "chapa", "vergalhao", "pneu"] if grande else ["pedra", "pedra", "vergalhao", "chapa"])
+        if any(dentro(x, y, ret_via(w)) for w in VIAS if w is not v) and v['eixo'] == 'y':
+            continue
+        colocar(g, x, y, Z_VIA)
+        cnt += 1
+    # calcadas e terrenos
+    for _ in range(170):
+        x, y = rng.uniform(-MET + 2, MET - 2), rng.uniform(-MET + 2, MET - 2)
+        if bloqueado(x, y, bloq_c) and not any(dentro(x, y, ret_via(v), CAL_L) for v in VIAS):
+            continue
+        g = rng.choice(["bloco", "laje", "pedra", "pedra", "chapa", "tubo", "caixa", "pneu", "barril"])
+        on_cal = any(dentro(x, y, ret_via(v), CAL_L) and not dentro(x, y, ret_via(v)) for v in VIAS)
+        if any(dentro(x, y, ret_via(v)) for v in VIAS) and g in ("laje", "tubo"):
+            continue
+        z = Z_CAL if on_cal else (Z_VIA if any(dentro(x, y, ret_via(v)) for v in VIAS) else None)
+        colocar(g, x, y, z)
+        cnt += 1
+    # patios cercados: barris de residuos e caixas
+    for rr in (RET_PATIO1, RET_PATIO2):
+        for _ in range(26):
+            x = rng.uniform(rr[0] + 0.8, rr[1] - 0.8)
+            y = rng.uniform(rr[2] + 0.8, rr[3] - 0.8)
+            colocar(rng.choice(["barril", "barril", "barril", "caixa", "pedra"]), x, y)
+            cnt += 1
+    # usina e galpoes
+    for _ in range(40):
+        x = rng.uniform(RET_USINA[0] + 2, RET_USINA[1] - 2)
+        y = rng.uniform(RET_USINA[2] + 2, RET_USINA[3] - 2)
+        if dentro(x, y, (29, 35, 45, 52)) or dentro(x, y, (50, 74, 52, 74)):
+            continue
+        colocar(rng.choice(["barril", "caixa", "bloco", "tubo", "pedra"]), x, y, Z_VIA)
+        cnt += 1
+    return cnt
+
+
+# ----------------------------------------------------------------------------
+# SINALIZACAO: placas, radiacao, cercas, portoes
+# ----------------------------------------------------------------------------
+def trifolio(m, c, r):
+    """Simbolo de radiacao em relevo (plano XZ, voltado para -Y)."""
+    cx, cy, cz = c
+    m.cil((cx, cy - 0.01, cz), r * 0.16, 0.02, (0, 1, 0), seg=14)
+    for k in range(3):
+        a0 = pi / 2 + k * 2 * pi / 3 - pi / 6
+        pts = [(cx, cz)]
+        for s in range(7):
+            a = a0 + s * (pi / 3) / 6
+            pts.append((cx + r * 0.85 * cos(a), cz + r * 0.85 * sin(a)))
+        pts[0] = (cx + r * 0.22 * cos(a0 + pi / 6), cz + r * 0.22 * sin(a0 + pi / 6))
+        pts = [(cx + (p[0] - cx), cz + (p[1] - cz)) for p in pts]
+        m.prisma(pts, cy - 0.03, cy - 0.005, 'XZ')
+
+
+def malhas_placas():
+    P = {}
+    # circular com borda (tipo proibicao), triangular, retangular, octogonal, radiacao
+    def poste(m, h):
+        m.cil((0, 0, h / 2), 0.045, h, seg=8)
+        m.cil((0, 0, 0.04), 0.09, 0.08, seg=8)
+    m = Malha("Placa_Redonda"); poste(m, 2.8)
+    m.cil((0, -0.07, 2.4), 0.35, 0.03, (0, 1, 0), seg=24); m.toro((0, -0.09, 2.4), 0.30, 0.02, (0, 1, 0), 24, 5)
+    m.box((0.0, -0.1, 2.4), (0.45, 0.01, 0.08), ry=0.7)
+    P["redonda"] = m.mesh("sinal", 0.004)
+    m = Malha("Placa_Triangular"); poste(m, 2.8)
+    m.prisma([(-0.4, 2.1), (0.4, 2.1), (0, 2.8)], -0.085, -0.055, 'XZ')
+    m.prisma([(-0.28, 2.18), (0.28, 2.18), (0, 2.62)], -0.095, -0.085, 'XZ')
+    P["triangular"] = m.mesh("sinal", 0.004)
+    m = Malha("Placa_Retangular"); poste(m, 2.6)
+    m.box((0, -0.07, 2.2), (0.8, 0.03, 0.55)); m.box((0, -0.09, 2.2), (0.7, 0.01, 0.45))
+    P["retangular"] = m.mesh("sinal", 0.004)
+    m = Malha("Placa_Parada")
+    poste(m, 2.8)
+    pts = [(0.35 * cos(pi / 8 + k * pi / 4), 2.45 + 0.35 * sin(pi / 8 + k * pi / 4)) for k in range(8)]
+    m.prisma(pts, -0.085, -0.055, 'XZ')
+    P["octogonal"] = m.mesh("sinal", 0.004)
+    m = Malha("Placa_Radiacao"); poste(m, 2.5)
+    m.prisma([(-0.45, 1.95), (0.45, 1.95), (0, 2.75)], -0.085, -0.055, 'XZ')
+    trifolio(m, (0, -0.0, 2.25), 0.26)
+    P["radiacao"] = m.mesh("sinal", 0.004)
+    m = Malha("Marcador_Radiacao")
+    m.cil((0, 0, 0.012), 0.8, 0.024, seg=28)
+    m.toro((0, 0, 0.03), 0.7, 0.025, (0, 0, 1), 28, 5)
+    for k in range(3):
+        a = k * 2 * pi / 3
+        m.box((cos(a) * 0.3, sin(a) * 0.3, 0.035), (0.32, 0.18, 0.02), yaw=a + pi / 2)
+    P["marcador"] = m.mesh("sinal", 0.0)
+    m = Malha("Placa_Baixa_Radiacao")                   # placa presa a cerca (baixa)
+    m.prisma([(-0.3, 0.0), (0.3, 0.0), (0, 0.52)], -0.03, 0.0, 'XZ')
+    trifolio(m, (0, 0.03, 0.2), 0.14)
+    P["cerca"] = m.mesh("sinal", 0.003)
+    return P
+
+
+def painel_cerca(m, rng, x0, y0, x1, y1, h=2.1, dano=0.10):
+    d = Vector((x1 - x0, y1 - y0, 0))
+    comp = d.length
+    if comp < 0.5:
+        return
+    ang = atan2(d.y, d.x)
+    n = max(1, int(round(comp / 2.5)))
+    w = comp / n
+    for i in range(n):
+        r = rng.random()
+        if r < dano * 0.5:
+            continue
+        base = Matrix.Translation((x0 + d.x * i / n, y0 + d.y * i / n, alt(x0 + d.x * (i + .5) / n, y0 + d.y * (i + .5) / n) - 0.03)) @ Matrix.Rotation(ang, 4, 'Z')
+        if r < dano:
+            base = base @ Matrix.Rotation(rng.choice([-1, 1]) * rng.uniform(0.9, 1.3), 4, 'X')
+        m.push(base)
+        for px in (0.0, w):
+            m.box((px, 0, h / 2.0), (0.1, 0.1, h))
+        m.box((w / 2.0, 0, h - 0.03), (w, 0.06, 0.06))
+        m.box((w / 2.0, 0, 0.12), (w, 0.06, 0.06))
+        m.box((w / 2.0, 0, h / 2.0), (w, 0.04, 0.04))
+        for k in range(int(w / 0.28)):
+            m.box((0.14 + k * 0.28, 0, h / 2.0), (0.02, 0.02, h - 0.2))
+        m.barra((0.05, 0, 0.15), (w - 0.05, 0, h - 0.15), 0.02, 0.02)
+        m.pop()
+
+
+def cerca_retangulo(m, rng, rr, abertura=None, h=2.1, dano=0.10):
+    x0, x1, y0, y1 = rr
+    lados = [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))]
+    for (a, b) in lados:
+        segs = [(a, b)]
+        if abertura:
+            ax, ay, w = abertura
+            novo = []
+            for (p, q) in segs:
+                if abs(p[1] - ay) < 1e-6 and abs(q[1] - ay) < 1e-6 and min(p[0], q[0]) < ax < max(p[0], q[0]):
+                    s = 1 if q[0] > p[0] else -1
+                    novo += [(p, (ax - w / 2.0 * s, ay)), ((ax + w / 2.0 * s, ay), q)]
+                else:
+                    novo.append((p, q))
+            segs = novo
+        for (p, q) in segs:
+            painel_cerca(m, rng, p[0], p[1], q[0], q[1], h, dano)
+
+
+def portao(m, cx, cy, w, h, aberto_x):
+    m.box((cx - w / 2.0, cy, h / 2.0), (0.3, 0.3, h))
+    m.box((cx + w / 2.0, cy, h / 2.0), (0.3, 0.3, h))
+    m.box((cx, cy, h + 0.1), (w + 0.3, 0.3, 0.25))
+    for k in range(3):
+        m.box((aberto_x, cy + 0.3, 0.3 + k * 0.7), (w * 0.55, 0.08, 0.06))
+    for k in range(10):
+        m.box((aberto_x - w * 0.27 + k * w * 0.06, cy + 0.3, h / 2.0 - 0.1), (0.04, 0.05, h - 0.4))
+    m.barra((aberto_x - w * 0.27, cy + 0.3, 0.2), (aberto_x + w * 0.27, cy + 0.3, h - 0.3), 0.04, 0.04)
+
+
+def sinalizacao():
+    rng = random.Random(SEED + 51)
+    P = malhas_placas()
+    # placas nas ruas (em pe, voltadas para a via) e algumas caidas
+    for _ in range(38):
+        v = rng.choice(VIAS)
+        t = rng.uniform(v['a'] + 4, v['b'] - 4)
+        sg = rng.choice([-1, 1])
+        off = sg * (v['l'] / 2.0 + CAL_L - 0.5)
+        x, y = (t, v['c'] + off) if v['eixo'] == 'x' else (v['c'] + off, t)
+        if dentro(x, y, LIVRE_INICIAL, 2.0) or any(dentro(x, y, ret_via(w), 0.2) for w in VIAS if w is not v):
+            continue
+        tipo = rng.choice(["redonda", "triangular", "retangular", "octogonal"])
+        yaw = (pi / 2 * sg) if v['eixo'] == 'x' else (pi if sg > 0 else 0.0)
+        if v['eixo'] == 'y':
+            yaw = pi / 2 if sg < 0 else -pi / 2
+        rot = (0, 0, yaw + rng.uniform(-0.1, 0.1))
+        if rng.random() < 0.28:
+            rot = (pi / 2 - rng.uniform(0, 0.15), 0, rng.uniform(0, 6.28))
+            instancia("PlacaCaida", P[tipo], "SINALIZACAO", (x, y, Z_CAL + 0.1), rot)
+        else:
+            instancia("Placa", P[tipo], "SINALIZACAO", (x, y, Z_CAL), (rng.uniform(-0.05, 0.05), 0, rot[2]))
+    # placas de radiacao: portao da usina, patios, entradas do cenario
+    pts = [(26.5, 44.0, 0.0), (36.0, 44.0, 0.0), (17.0, 13.0, 0.0), (11.0, 20.0, -pi / 2), (17.0, -13.0, 0.0),
+           (11.0, -20.0, -pi / 2), (-20.0, 38.0, 0.0), (60.0, 36.0, 0.0), (25.0, 36.0, 0.0)]
+    for (x, y, yaw) in pts:
+        z = alt(x, y)
+        on_road = any(dentro(x, y, ret_via(v)) for v in VIAS)
+        if on_road:
+            continue
+        instancia("PlacaRadiacao", P["radiacao"], "SINALIZACAO", (x, y, z), (0, 0, yaw + rng.uniform(-0.2, 0.2)))
+    # marcadores de contaminacao discretos no chao
+    for _ in range(16):
+        v = rng.choice(VIAS)
+        t = rng.uniform(v['a'] + 6, v['b'] - 6)
+        off = rng.choice([-1, 1]) * rng.uniform(1.8, v['l'] / 2.0 - 0.9)
+        x, y = (t, v['c'] + off) if v['eixo'] == 'x' else (v['c'] + off, t)
+        if dentro(x, y, LIVRE_INICIAL, 2.0):
+            continue
+        instancia("MarcadorContaminacao", P["marcador"], "SINALIZACAO", (x, y, Z_VIA), (0, 0, rng.uniform(0, 6.28)), rng.uniform(0.7, 1.2))
+    for rr in (RET_PATIO1, RET_PATIO2):
+        for _ in range(3):
+            x, y = rng.uniform(rr[0] + 1.5, rr[1] - 1.5), rng.uniform(rr[2] + 1.5, rr[3] - 1.5)
+            instancia("MarcadorContaminacao", P["marcador"], "SINALIZACAO", (x, y, alt(x, y)), (0, 0, rng.uniform(0, 6.28)))
+    # cercas metalicas, portoes industriais
+    c = Malha("Cercas_Metalicas")
+    cerca_retangulo(c, rng, RET_PATIO1, (18.0, 14.0, 4.0))
+    cerca_retangulo(c, rng, RET_PATIO2, (18.0, -14.0, 4.0))
+    cerca_retangulo(c, rng, (RET_USINA[0], RET_USINA[1], RET_USINA[2], 74.4), (32.0, 45.0, 6.0), 2.4, 0.05)
+    cerca_retangulo(c, rng, RET_GALPOES, None, 2.0, 0.10)
+    cerca_retangulo(c, rng, (-60.0, -35.0, 56.0, 72.0), (-47.5, 56.0, 4.0), 2.0, 0.25)
+    portao(c, 18.0, 14.0, 4.0, 2.2, 21.5)
+    portao(c, 18.0, -14.0, 4.0, 2.2, 21.5)
+    portao(c, 32.0, 45.0, 6.0, 2.8, 38.0)
+    c.objeto("SINALIZACAO", "metal", 0.012)
+    # grades de protecao junto a bueiros e escadas (pequenas estruturas de seguranca)
+    for (x, y) in ((21.0, 36.0), (-18.0, 36.5), (45.0, 36.0)):
+        for k in range(4):
+            instancia("PlacaCerca", P["cerca"], "SINALIZACAO", (x + k * 0.8, y, 1.0), (0, 0, 0))
+    # barreiras de concreto (jersey) e cavaletes
+    b = Malha("Barreiras_Concreto")
+    for (x, y, yaw) in ((-12.0, 40.8, 0.0), (-8.5, 41.0, 0.05), (36.0, -36.8, 0.0), (36.0, -38.0, 0.0), (50.0, 44.0, 0.0), (54.0, 44.2, -0.05)):
+        b.push(Matrix.Translation((x, y, Z_VIA)) @ Matrix.Rotation(yaw, 4, 'Z'))
+        b.prisma([(-1.5, 0.0), (1.5, 0.0), (1.5, 0.1), (1.3, 0.8), (-1.3, 0.8), (-1.5, 0.1)], -0.25, 0.25, 'XZ')
+        b.pop()
+    b.objeto("SINALIZACAO", "concreto", 0.012)
+
+
+# ----------------------------------------------------------------------------
+# ILUMINACAO: postes, lampadas industriais, fios pendurados
+# ----------------------------------------------------------------------------
+def malha_poste(nome, braco=1.6, duplo=False):
+    m = Malha(nome)
+    m.cil((0, 0, 3.75), 0.11, 7.5, seg=10, r2=0.07)
+    m.cil((0, 0, 0.35), 0.17, 0.7, seg=10)
+    m.cil((0, 0, 0.72), 0.2, 0.06, seg=10)
+    for sg in ((1,) if not duplo else (1, -1)):
+        m.tubo((0, 0, 7.2), (sg * braco * 0.6, 0, 7.55), 0.04, 6)
+        m.tubo((sg * braco * 0.6, 0, 7.55), (sg * braco, 0, 7.45), 0.04, 6)
+        m.box((sg * braco, 0, 7.38), (0.55, 0.22, 0.1))
+        m.cil((sg * braco, 0, 7.3), 0.12, 0.1, seg=10, r2=0.18)
+    m.box((0, 0, 6.6), (0.3, 0.12, 0.05))
+    m.box((0, 0, 7.0), (0.6, 0.05, 0.05))
+    for sg in (-1, 1):
+        m.cil((sg * 0.3, 0, 7.04), 0.025, 0.06, seg=6)
+    return m.mesh("luz", 0.006)
+
+
+def fios(m, a, b, sag, n=9, r=0.012):
+    a, b = Vector(a), Vector(b)
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        p = a + (b - a) * t
+        p.z -= sag * 4.0 * t * (1 - t)
+        pts.append(p)
+    m.cabo(pts, r, 4)
+
+
+def iluminacao():
+    rng = random.Random(SEED + 61)
+    mp = [malha_poste("Poste_A", 1.6), malha_poste("Poste_B", 1.4, True), malha_poste("Poste_C", 1.1)]
+    w = Malha("Fios_Eletricos")
+    linhas = {}
+    for v in VIAS:
+        h = v['l'] / 2.0
+        for sg in (-1, 1):
+            off = sg * (h + 1.0)
+            pos = []
+            t = v['a'] + 8 + (6 if sg > 0 else 0)
+            while t < v['b'] - 4:
+                x, y = (t, v['c'] + off) if v['eixo'] == 'x' else (v['c'] + off, t)
+                ok = not dentro(x, y, LIVRE_INICIAL, 4.0)
+                ok = ok and not any(dentro(x, y, ret_via(u), 2.0) for u in VIAS if u is not v)
+                ok = ok and not any(dentro(x, y, ret_predio(p, 0.5)) for p in PREDIOS)
+                if ok:
+                    pos.append((x, y))
+                t += 20.0
+            for (x, y) in pos:
+                tilt = rng.uniform(-0.1, 0.1) if rng.random() < 0.25 else 0.0
+                yaw = ((pi / 2) * (1 if sg < 0 else -1)) if v['eixo'] == 'x' else (pi if sg > 0 else 0.0)
+                if v['eixo'] == 'y':
+                    yaw = 0.0 if sg > 0 else pi
+                    yaw = pi / 2 if sg < 0 else -pi / 2
+                instancia("Poste", rng.choice(mp), "ILUMINACAO", (x, y, alt(x, y) if not any(dentro(x, y, ret_via(u), CAL_L) for u in VIAS) else Z_CAL), (tilt, 0, yaw))
+            linhas[(v['nome'], sg)] = pos
+    for (k, pos) in linhas.items():
+        for a, b in zip(pos[:-1], pos[1:]):
+            if hypot(b[0] - a[0], b[1] - a[1]) > 24.0:
+                continue
+            for dz, dy in ((7.0, 0.0), (6.7, 0.0), (6.4, 0.0)):
+                fios(w, (a[0], a[1], dz), (b[0], b[1], dz), 0.45)
+        # fio solto pendurado (ponta a 3,3 m do chao)
+        if len(pos) > 2 and rng.random() < 0.7:
+            a = pos[1]
+            fios(w, (a[0], a[1], 7.0), (a[0] + 4.0, a[1], 3.3), 0.2, 6)
+    w.objeto("ILUMINACAO", "luz", 0.0)
+    # lampadas industriais em paredes de galpoes e na usina
+    l = Malha("Lampadas_Industriais")
+    for (x, y, d) in ((26.0, 49.0, (0, -1)), (37.0, 48.8, (0, -1)), (48.0, 48.8, (0, -1)), (44.0, 33.8, (0, -1)), (51.0, 33.8, (0, -1)),
+                      (60.0, 33.8, (0, -1)), (74.0, 33.8, (0, -1)), (50.0, 49.0, (0, -1))):
+        l.tubo((x, y, 4.3), (x + d[0] * 0.5, y + d[1] * 0.5, 4.5), 0.03, 6)
+        l.cil((x + d[0] * 0.6, y + d[1] * 0.6, 4.4), 0.12, 0.22, seg=10, r2=0.2)
+        l.cil((x + d[0] * 0.6, y + d[1] * 0.6, 4.28), 0.08, 0.06, seg=10)
+    for (x, y) in ((24.0, 46.5), (73.0, 46.5), (24.0, 73.0)):
+        l.cil((x, y, 5.0), 0.1, 10.0, seg=8)
+        l.box((x, y, 10.1), (0.9, 0.5, 0.3))
+        for k in range(3):
+            l.cil((x + (k - 1) * 0.28, y - 0.28, 10.1), 0.09, 0.1, (0, 1, 0), seg=10)
+    l.objeto("ILUMINACAO", "metal", 0.008)
+
+
+# ----------------------------------------------------------------------------
+# CAMERAS, LUZES, MUNDO
+# ----------------------------------------------------------------------------
+def estudio():
+    sc = bpy.context.scene
+    alvo = bpy.data.objects.new("Alvo_Camera", None)
+    alvo.location = (10.0, 12.0, 2.0)
+    COL["ILUMINACAO"].objects.link(alvo)
+
+    def mira(o, t):
+        c = o.constraints.new('TRACK_TO')
+        c.target = t
+        c.track_axis = 'TRACK_NEGATIVE_Z'
+        c.up_axis = 'UP_Y'
+
+    cd = bpy.data.cameras.new("Camera_Apresentacao")
+    cd.lens = 32
+    cd.clip_end = 1000
+    cam = bpy.data.objects.new("Camera_Apresentacao", cd)
+    cam.location = (-150.0, -150.0, 95.0)
+    COL["ILUMINACAO"].objects.link(cam)
+    mira(cam, alvo)
+    sc.camera = cam
+
+    cd2 = bpy.data.cameras.new("Camera_Nivel_Robo")
+    cd2.lens = 28
+    cd2.clip_end = 1000
+    cam2 = bpy.data.objects.new("Camera_Nivel_Robo", cd2)
+    cam2.location = (-1.0, -0.0, Z_VIA + 1.35)
+    cam2.rotation_euler = (radians(88), 0, radians(-90))
+    COL["ILUMINACAO"].objects.link(cam2)
+
+    sol = bpy.data.lights.new("Sol_Baixo", 'SUN')
+    sol.energy = 3.0
+    sol.color = (1.0, 0.86, 0.68)
+    sol.angle = radians(4)
+    so = bpy.data.objects.new("Sol_Baixo", sol)
+    so.rotation_euler = (radians(52), radians(8), radians(-125))
+    COL["ILUMINACAO"].objects.link(so)
+    for nome, loc, en, tam in (("Preenchimento", (-80.0, 80.0, 70.0), 50000.0, 60.0), ("Contorno", (90.0, -60.0, 50.0), 30000.0, 40.0)):
+        d = bpy.data.lights.new(nome, 'AREA')
+        d.energy = en
+        d.size = tam
+        d.color = (0.75, 0.85, 1.0)
+        o = bpy.data.objects.new(nome, d)
+        o.location = loc
+        COL["ILUMINACAO"].objects.link(o)
+        mira(o, alvo)
+    if sc.world is None:
+        sc.world = bpy.data.worlds.new("Mundo_Chernobyl")
+    sc.world.use_nodes = True
+    bg = sc.world.node_tree.nodes.get("Background")
+    if bg:
+        bg.inputs[0].default_value = (0.42, 0.50, 0.60, 1)
+        bg.inputs[1].default_value = 1.1
+    sc.render.resolution_x = 1920
+    sc.render.resolution_y = 1080
+    for eng in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE', 'CYCLES'):
+        try:
+            sc.render.engine = eng
+            break
+        except TypeError:
+            continue
+
+    # marcador da posicao inicial do robo (caixa 1,40 x 0,85 x 1,60 m)
+    e = bpy.data.objects.new("POSICAO_INICIAL_CHERNOBYL_01", None)
+    e.empty_display_type = 'CUBE'
+    e.empty_display_size = 1.0
+    e.scale = (0.7, 0.425, 0.8)
+    e.location = (POS_ROBO[0], POS_ROBO[1], Z_VIA + 0.8)
+    COL["TERRENO"].objects.link(e)
+
+
+def main():
+    import time
+    t0 = time.time()
+    limpar_cena()
+    criar_colecoes()
+    criar_materiais()
+    construir_ruas()          # primeiro: define os buracos que o terreno usa
+    construir_terreno()
+    for p in PREDIOS:
+        nome, tipo, cx, cy, yaw, L, W, n, bw, col = p
+        extra = colunata_cultura if tipo == "cultura" else None
+        m, _ = predio(nome, tipo, cx, cy, yaw, L, W, n, bw, col, SEED + sum(map(ord, nome)), extra)
+        m.objeto("EDIFICIOS", "predio_%d" % (PREDIOS.index(p) % 4), 0.03)
+    roda_gigante()
+    garagens()
+    pequenas_estruturas()
+    usina()
+    vegetacao()
+    veiculos()
+    destrocos()
+    sinalizacao()
+    iluminacao()
+    estudio()
+    print("Cenario de Pripyat gerado em %.1f s" % (time.time() - t0))
+
+
+main()
