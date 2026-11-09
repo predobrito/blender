@@ -1,0 +1,902 @@
+# -*- coding: utf-8 -*-
+"""
+CHERNOBYL-01 - Robô terrestre de inspeção nuclear (versão PS1: low poly, sem detalhes inúteis)
+Cole este script na aba "Scripting" do Blender (3.6 ou superior, incluindo 4.x) e clique em Executar.
+Eixos: +X = frente do robô, +Y = esquerda, +Z = cima. Unidades em metros.
+"""
+import bpy
+import bmesh
+from math import pi, sin, cos, atan2
+from mathutils import Vector, Matrix
+
+# ----------------------------------------------------------------------------
+# CONSTANTES GLOBAIS
+# ----------------------------------------------------------------------------
+NOMES_COLECOES = ["CHASSI", "ESTEIRAS", "TORRE_DE_SENSORES", "BRACO_ROBOTICO",
+                  "ANTENAS_E_EQUIPAMENTOS", "DETALHES"]
+COL = {}
+MAT = None
+MAT_CHAO = None
+PAR = None    # parafusos e rebites
+CAB = None    # cabos e mangueiras
+VENT = None   # grades de ventilação e painéis
+
+# Esteiras
+ZC = 0.19          # altura do centro das rodas
+LU = 0.27          # distância entre eixos de cada conjunto
+RP = 0.17          # raio da linha de centro das placas da esteira
+PERIM = 2 * LU + 2 * pi * RP
+N_SEG = int(round(PERIM / 0.075))
+PITCH = PERIM / N_SEG
+CY = 0.34          # posição lateral do centro das esteiras
+LARG_E = 0.13      # largura da esteira
+
+TOPO = 0.58        # altura do topo do chassi (onde assentam torre e braço)
+X0 = 0.10          # posição X da torre de sensores
+
+
+# ----------------------------------------------------------------------------
+# UTILIDADES
+# ----------------------------------------------------------------------------
+def limpar_cena():
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o, do_unlink=True)
+    for c in list(bpy.data.collections):
+        bpy.data.collections.remove(c)
+    for m in list(bpy.data.meshes):
+        if m.users == 0:
+            bpy.data.meshes.remove(m)
+
+
+def criar_colecoes():
+    for n in NOMES_COLECOES:
+        c = bpy.data.collections.new(n)
+        bpy.context.scene.collection.children.link(c)
+        COL[n] = c
+
+
+def criar_materiais():
+    global MAT, MAT_CHAO
+    MAT = bpy.data.materials.new("CLAY_CINZA_CLARO")
+    MAT.use_nodes = True
+    MAT.diffuse_color = (0.62, 0.62, 0.62, 1)
+    b = MAT.node_tree.nodes.get("Principled BSDF")
+    if b:
+        b.inputs["Base Color"].default_value = (0.62, 0.62, 0.62, 1)
+        b.inputs["Roughness"].default_value = 0.62
+        b.inputs["Metallic"].default_value = 0.0
+    MAT_CHAO = bpy.data.materials.new("CHAO_ESCURO")
+    MAT_CHAO.use_nodes = True
+    MAT_CHAO.diffuse_color = (0.05, 0.05, 0.055, 1)
+    b = MAT_CHAO.node_tree.nodes.get("Principled BSDF")
+    if b:
+        b.inputs["Base Color"].default_value = (0.05, 0.05, 0.055, 1)
+        b.inputs["Roughness"].default_value = 0.9
+
+
+def M_trans(loc):
+    return Matrix.Translation(Vector(loc))
+
+
+def M_eixo(loc, d):
+    """Translada para loc e alinha o eixo Z local com a direção d."""
+    d = Vector(d).normalized()
+    q = Vector((0, 0, 1)).rotation_difference(d)
+    return M_trans(loc) @ q.to_matrix().to_4x4()
+
+
+class Peca:
+    """Acumula várias primitivas (com bevel) em uma única malha."""
+
+    def __init__(self, nome, colecao):
+        self.nome = nome
+        self.col = COL[colecao]
+        self.bm = bmesh.new()
+
+    # -- mescla uma malha temporária na malha principal
+    def _merge(self, tmp, M):
+        bmesh.ops.transform(tmp, matrix=M, verts=tmp.verts[:])
+        vm = {}
+        for v in tmp.verts:
+            vm[v] = self.bm.verts.new(v.co)
+        for f in tmp.faces:
+            try:
+                nf = self.bm.faces.new([vm[v] for v in f.verts])
+                nf.smooth = f.smooth
+            except ValueError:
+                pass
+        tmp.free()
+
+    @staticmethod
+    def _bisel(tmp, edges, b, lim):
+        return   # PS1: sem bevel
+        b = min(b, lim * 0.3)
+        if b <= 1e-4 or not edges:
+            return
+        try:
+            bmesh.ops.bevel(tmp, geom=edges, offset=b, segments=1,
+                            affect='EDGES', clamp_overlap=True)
+        except Exception:
+            pass
+
+    # -- caixa com bordas chanfradas
+    def caixa(self, size, loc=None, bisel=0.004, M=None):
+        tmp = bmesh.new()
+        bmesh.ops.create_cube(tmp, size=1.0)
+        for v in tmp.verts:
+            v.co.x *= size[0]
+            v.co.y *= size[1]
+            v.co.z *= size[2]
+        self._bisel(tmp, tmp.edges[:], bisel, min(size))
+        self._merge(tmp, M if M is not None else M_trans(loc))
+
+    # -- cilindro / cone, orientado por d (eixo)
+    def cil(self, r, prof, loc, d=(0, 0, 1), r2=None, seg=24, bisel=0.003):
+        seg = max(6, seg // 3)   # PS1: poucos lados
+        tmp = bmesh.new()
+        r2 = r if r2 is None else r2
+        h = prof / 2.0
+        r0 = [tmp.verts.new((r * cos(2 * pi * i / seg), r * sin(2 * pi * i / seg), -h))
+              for i in range(seg)]
+        r1 = [tmp.verts.new((r2 * cos(2 * pi * i / seg), r2 * sin(2 * pi * i / seg), h))
+              for i in range(seg)]
+        for i in range(seg):
+            j = (i + 1) % seg
+            tmp.faces.new((r0[i], r0[j], r1[j], r1[i]))
+        tmp.faces.new(r0[::-1])
+        tmp.faces.new(r1)
+        bmesh.ops.recalc_face_normals(tmp, faces=tmp.faces[:])
+        tmp.normal_update()
+        if bisel > 0 and abs(r - r2) < 1e-6:
+            ed = []
+            for e in tmp.edges:
+                nz = [abs(f.normal.z) for f in e.link_faces]
+                if len(nz) == 2 and max(nz) > 0.99 and min(nz) < 0.5:
+                    ed.append(e)
+            self._bisel(tmp, ed, bisel, min(r, prof))
+            tmp.normal_update()
+        for f in tmp.faces:
+            f.smooth = False
+        self._merge(tmp, M_eixo(loc, d))
+
+    # -- prisma extrudado a partir de um polígono 2D
+    def prisma(self, pts, w0, w1, plano='XY', bisel=0.003):
+        tmp = bmesh.new()
+
+        def P(u, v, w):
+            if plano == 'XY':
+                return (u, v, w)
+            if plano == 'XZ':
+                return (u, w, v)
+            return (w, u, v)  # 'YZ'
+
+        a = [tmp.verts.new(P(u, v, w0)) for u, v in pts]
+        b = [tmp.verts.new(P(u, v, w1)) for u, v in pts]
+        n = len(pts)
+        tmp.faces.new(a[::-1])
+        tmp.faces.new(b)
+        for i in range(n):
+            j = (i + 1) % n
+            tmp.faces.new((a[i], a[j], b[j], b[i]))
+        bmesh.ops.recalc_face_normals(tmp, faces=tmp.faces[:])
+        lim = abs(w1 - w0)
+        self._bisel(tmp, tmp.edges[:], bisel, lim)
+        self._merge(tmp, Matrix.Identity(4))
+
+    # -- toro (mangueiras, argolas)
+    def toro(self, R, r, loc, d=(0, 0, 1), maj=28, mi=8):
+        maj, mi = 10, 4
+        tmp = bmesh.new()
+        vs = []
+        for i in range(maj):
+            a = 2 * pi * i / maj
+            fila = []
+            for j in range(mi):
+                b = 2 * pi * j / mi
+                rr = R + r * cos(b)
+                fila.append(tmp.verts.new((rr * cos(a), rr * sin(a), r * sin(b))))
+            vs.append(fila)
+        for i in range(maj):
+            for j in range(mi):
+                i2, j2 = (i + 1) % maj, (j + 1) % mi
+                f = tmp.faces.new((vs[i][j], vs[i2][j], vs[i2][j2], vs[i][j2]))
+                f.smooth = False
+        bmesh.ops.recalc_face_normals(tmp, faces=tmp.faces[:])
+        self._merge(tmp, M_eixo(loc, d))
+
+    # -- cilindro entre dois pontos
+    def tubo(self, p1, p2, r, seg=12, r2=None):
+        p1, p2 = Vector(p1), Vector(p2)
+        d = p2 - p1
+        if d.length < 1e-6:
+            return
+        self.cil(r, d.length, (p1 + p2) / 2, d, r2=r2, seg=seg, bisel=0)
+
+    # -- barra retangular entre dois pontos (eixo X local ao longo da barra)
+    def barra(self, p1, p2, wy, wz, bisel=0.003):
+        p1, p2 = Vector(p1), Vector(p2)
+        d = p2 - p1
+        if d.length < 1e-6:
+            return
+        M = M_trans((p1 + p2) / 2) @ d.to_track_quat('X', 'Z').to_matrix().to_4x4()
+        self.caixa((d.length, wy, wz), None, bisel, M)
+
+    def malha(self):
+        mesh = bpy.data.meshes.new(self.nome)
+        self.bm.to_mesh(mesh)
+        self.bm.free()
+        return mesh
+
+    def concluir(self, material=None):
+        mesh = self.malha()
+        mesh.materials.append(material or MAT)
+        obj = bpy.data.objects.new(self.nome, mesh)
+        self.col.objects.link(obj)
+        return obj
+
+
+# ----------------------------------------------------------------------------
+# FUNÇÕES REUTILIZÁVEIS DE DETALHE
+# ----------------------------------------------------------------------------
+def base_ortho(eixo):
+    a = Vector(eixo).normalized()
+    ref = Vector((0, 0, 1)) if abs(a.z) < 0.9 else Vector((1, 0, 0))
+    u = a.cross(ref).normalized()
+    v = a.cross(u).normalized()
+    return a, u, v
+
+
+def anel_parafusos(centro, raio, n, eixo, r=0.006, h=0.006, fase=0.0):
+    return
+    a, u, v = base_ortho(eixo)
+    c = Vector(centro)
+    for i in range(n):
+        t = fase + 2 * pi * i / n
+        PAR.cil(r, h, c + (u * cos(t) + v * sin(t)) * raio, a, seg=6, bisel=0)
+
+
+def parafusos_retangulo(centro, w, h, eixo, r=0.006, alt=0.006):
+    return
+    a, u, v = base_ortho(eixo)
+    c = Vector(centro)
+    for su in (-1, 1):
+        for sv in (-1, 1):
+            PAR.cil(r, alt, c + u * (su * w / 2) + v * (sv * h / 2), a, seg=6, bisel=0)
+
+
+def lente(p, loc, r, d=(1, 0, 0), prof=0.03):
+    """Módulo óptico: barril, anel frontal, vidro e núcleo."""
+    a = Vector(d).normalized()
+    loc = Vector(loc)
+    p.cil(r, prof, loc - a * prof / 2, a, seg=28, bisel=0.002)
+    p.cil(r * 0.8, 0.012, loc + a * 0.008, a, seg=28)
+
+
+def cabo(p, pts, r, juntas=True, seg=10):
+    if r < 0.0095:
+        return   # PS1: cabos finos e alças pequenas eliminados
+    juntas = False
+    pts = [Vector(q) for q in pts]
+    for a, b in zip(pts[:-1], pts[1:]):
+        if (b - a).length > 1e-5:
+            p.tubo(a, b, r, seg)
+    if juntas:
+        for i in range(1, len(pts) - 1):
+            d = pts[i + 1] - pts[i - 1]
+            if d.length > 1e-5:
+                p.cil(r * 1.12, r * 2.4, pts[i], d, seg=seg, bisel=0)
+
+
+def curva(p0, p1, p2, n=8):
+    p0, p1, p2 = Vector(p0), Vector(p1), Vector(p2)
+    out = []
+    for i in range(n + 1):
+        t = i / n
+        out.append((1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t * t * p2)
+    return out
+
+
+def atuador(p, A, B, r_cil=0.02, r_haste=0.011, frac=0.55, eixo_pino=(0, 1, 0)):
+    """Atuador hidráulico: cilindro + haste + colar + olhais de fixação."""
+    A, B = Vector(A), Vector(B)
+    M = A + (B - A) * frac
+    p.tubo(A, M, r_cil, seg=16)
+    p.tubo(M, B, r_haste, seg=12)
+    d = (B - A).normalized()
+    p.cil(r_cil * 0.9, r_cil * 3.0, A, eixo_pino, seg=14, bisel=0.002)
+    p.cil(r_haste * 1.4, r_haste * 4.0, B, eixo_pino, seg=14, bisel=0.002)
+
+
+def estadio(x1, x2, z, r, n=10):
+    pts = []
+    for i in range(n + 1):
+        a = pi / 2 + pi * i / n
+        pts.append((x1 + r * cos(a), z + r * sin(a)))
+    for i in range(n + 1):
+        a = -pi / 2 + pi * i / n
+        pts.append((x2 + r * cos(a), z + r * sin(a)))
+    return pts
+
+
+# ----------------------------------------------------------------------------
+# ESTEIRAS
+# ----------------------------------------------------------------------------
+def malha_segmento():
+    """Um elo de esteira: placa, garra, trilhos laterais, dente-guia e pino."""
+    p = Peca("Elo_Esteira", "ESTEIRAS")
+    w = PITCH
+    p.caixa((w * 0.94, LARG_E, 0.016), (0, 0, 0), 0.0)
+    p.caixa((w * 0.55, LARG_E - 0.012, 0.014), (0, 0, 0.014), 0.0)
+    return p.malha()
+
+
+def ponto_caminho(s, x1, x2):
+    s %= PERIM
+    if s < LU:
+        return (x1 + s, ZC + RP, 1.0, 0.0)
+    s -= LU
+    arc = pi * RP
+    if s < arc:
+        phi = pi / 2 - s / RP
+        return (x2 + RP * cos(phi), ZC + RP * sin(phi), sin(phi), -cos(phi))
+    s -= arc
+    if s < LU:
+        return (x2 - s, ZC - RP, -1.0, 0.0)
+    s -= LU
+    phi = -pi / 2 - s / RP
+    return (x1 + RP * cos(phi), ZC + RP * sin(phi), sin(phi), -cos(phi))
+
+
+def construir_esteira(nome, cx, lado, malha_seg):
+    cy = lado * CY
+    x1, x2 = cx - LU / 2, cx + LU / 2
+
+    # 1) correia: elos individuais (instâncias da mesma malha)
+    for i in range(N_SEG):
+        s = (i + 0.5) * PITCH
+        x, z, tx, tz = ponto_caminho(s, x1, x2)
+        beta = -atan2(tz, tx)
+        M = Matrix.Translation((x, cy, z)) @ Matrix.Rotation(beta, 4, 'Y')
+        o = bpy.data.objects.new("%s_elo%02d" % (nome, i), malha_seg)
+        o.matrix_world = M
+        COL["ESTEIRAS"].objects.link(o)
+
+    # 2) rodas, eixos e roletes
+    p = Peca(nome + "_Rodas", "ESTEIRAS")
+    x_dentada = x1 if cx > 0 else x2
+    x_tensora = x2 if cx > 0 else x1
+    Y = (0, 1, 0)
+
+    # roda dentada (sprocket)
+    c = Vector((x_dentada, cy, ZC))
+    p.cil(0.100, 0.042, c, Y, seg=32)
+    for s in (-1, 1):
+        p.cil(0.125, 0.018, c + Vector((0, s * 0.036, 0)), Y, seg=40, bisel=0.002)
+    n_d = 8
+    for k in range(n_d):
+        a = 2 * pi * k / n_d
+        pos = c + Vector((cos(a) * 0.135, 0, sin(a) * 0.135))
+        M = M_trans(pos) @ Matrix.Rotation(-a, 4, 'Y')
+        p.caixa((0.026, 0.030, 0.017), None, 0.002, M)
+    p.cil(0.040, 0.100, c, Y, seg=20)
+
+    # roda tensora (idler) com raios e aro
+    c = Vector((x_tensora, cy, ZC))
+    for s in (-1, 1):
+        p.cil(0.133, 0.016, c + Vector((0, s * 0.037, 0)), Y, seg=40, bisel=0.002)
+    p.cil(0.095, 0.050, c, Y, seg=32)
+    for k in range(6):
+        a = 2 * pi * k / 6 + pi / 6
+        pos = c + Vector((cos(a) * 0.075, 0, sin(a) * 0.075))
+        M = M_trans(pos) @ Matrix.Rotation(-a, 4, 'Y')
+        p.caixa((0.060, 0.080, 0.014), None, 0.002, M)
+    p.cil(0.040, 0.100, c, Y, seg=20)
+
+    # roletes internos de sustentação e rolete superior
+    p.cil(0.035, 0.075, (cx, cy, ZC - 0.127), Y, seg=20)
+    p.cil(0.016, 0.100, (cx, cy, ZC - 0.127), Y, seg=12)
+    p.cil(0.020, 0.062, (cx, cy, ZC + 0.140), Y, seg=16)
+    p.barra((cx, cy - lado * 0.045, ZC - 0.127), (x_dentada, cy - lado * 0.045, ZC), 0.012, 0.012)
+
+    # eixos
+    for xw in (x1, x2):
+        p.cil(0.020, 0.185, (xw, lado * 0.3575, ZC), Y, seg=16)
+    p.concluir()
+
+    # 3) proteção lateral articulada (placa externa)
+    q = Peca(nome + "_Protecao", "ESTEIRAS")
+    y0, y1 = lado * 0.407, lado * 0.429
+    q.prisma(estadio(x1, x2, ZC, 0.105), y0, y1, 'XZ', 0.004)
+    q.prisma(estadio(x1, x2, ZC, 0.082), y1, lado * 0.434, 'XZ', 0.003)
+    q.caixa((LU * 0.9, 0.008, 0.050), (cx, lado * 0.4375, ZC), 0.002)
+    for xw in (x1, x2):
+        q.cil(0.050, 0.020, (xw, lado * 0.444, ZC), Y, seg=28, bisel=0.003)
+        q.cil(0.020, 0.010, (xw, lado * 0.455, ZC), Y, seg=16, bisel=0.002)
+        anel_parafusos((xw, lado * 0.451, ZC), 0.034, 6, (0, lado, 0), r=0.0045, h=0.005)
+    # parafusos da placa
+    for dx in (-0.08, 0.0, 0.08):
+        PAR.cil(0.005, 0.005, (cx + dx, lado * 0.4385, ZC + 0.035), (0, lado, 0), seg=6, bisel=0)
+        PAR.cil(0.005, 0.005, (cx + dx, lado * 0.4385, ZC - 0.035), (0, lado, 0), seg=6, bisel=0)
+    q.concluir()
+
+
+# ----------------------------------------------------------------------------
+# CHASSI
+# ----------------------------------------------------------------------------
+def construir_chassi():
+    p = Peca("Chassi_Casco", "CHASSI")
+
+    # casco inferior (entre as esteiras)
+    inf = [(-0.50, -0.20), (-0.40, -0.26), (0.40, -0.26), (0.50, -0.18),
+           (0.50, 0.18), (0.40, 0.26), (-0.40, 0.26), (-0.50, 0.20)]
+    p.prisma(inf, 0.14, 0.40, 'XY', 0.006)
+    # casco superior (sobre as esteiras)
+    sup = [(-0.46, -0.30), (-0.36, -0.37), (0.40, -0.37), (0.54, -0.27),
+           (0.54, 0.27), (0.40, 0.37), (-0.36, 0.37), (-0.46, 0.30)]
+    p.prisma(sup, 0.40, 0.52, 'XY', 0.006)
+    # cabine superior
+    cab = [(-0.42, -0.22), (-0.34, -0.27), (0.30, -0.27), (0.40, -0.19),
+           (0.40, 0.19), (0.30, 0.27), (-0.34, 0.27), (-0.42, 0.22)]
+    p.prisma(cab, 0.52, TOPO, 'XY', 0.005)
+
+    # placas de proteção sobrepostas (laterais)
+    for lado in (1, -1):
+        y = lado * 0.374
+        # painel de manutenção
+        p.caixa((0.22, 0.014, 0.085), (-0.01, y, 0.46), 0.003)
+        p.caixa((0.15, 0.008, 0.050), (-0.01, lado * 0.382, 0.46), 0.002)
+        parafusos_retangulo((-0.01, lado * 0.386, 0.46), 0.19, 0.070, (0, lado, 0))
+        # grade de ventilação
+        VENT.caixa((0.18, 0.012, 0.095), (0.22, lado * 0.372, 0.46), 0.002)
+        for i in range(6):
+            VENT.caixa((0.15, 0.010, 0.0075), (0.22, lado * 0.380, 0.425 + i * 0.0145), 0.0015)
+        # compartimento lateral de equipamentos
+        p.caixa((0.20, 0.030, 0.090), (-0.22, lado * 0.385, 0.46), 0.004)
+        p.caixa((0.17, 0.010, 0.070), (-0.22, lado * 0.403, 0.46), 0.002)
+        p.cil(0.011, 0.014, (-0.31 + 0.0, lado * 0.408, 0.46), (0, lado, 0), seg=16)
+        parafusos_retangulo((-0.22, lado * 0.409, 0.46), 0.15, 0.060, (0, lado, 0))
+        # alça metálica
+        cabo(CAB, [(-0.22 + 0.04, lado * 0.404, 0.435), (-0.22 + 0.04, lado * 0.428, 0.435),
+                   (-0.22 + 0.04, lado * 0.428, 0.485), (-0.22 + 0.04, lado * 0.404, 0.485)], 0.007)
+        # painéis do casco inferior (vão entre esteiras)
+        p.caixa((0.08, 0.012, 0.14), (0.0, lado * 0.264, 0.27), 0.003)
+        for i in range(4):
+            VENT.caixa((0.06, 0.008, 0.008), (0.0, lado * 0.272, 0.22 + i * 0.03), 0.0015)
+        # olhais de içamento
+        for xx in (0.30, -0.30):
+            p.cil(0.018, 0.016, (xx, lado * 0.20, TOPO + 0.008), (0, 0, 1), seg=16)
+            p.toro(0.024, 0.0055, (xx, lado * 0.20, TOPO + 0.036), (0, 1, 0))
+        # faróis frontais
+        p.caixa((0.06, 0.12, 0.11), (0.50, lado * 0.32, 0.46), 0.005)
+        for dy in (-1, 1):
+            for dz in (-1, 1):
+                lente(p, (0.53, lado * 0.32 + dy * 0.027, 0.46 + dz * 0.027), 0.017, (1, 0, 0), 0.012)
+        parafusos_retangulo((0.53, lado * 0.32, 0.46), 0.108, 0.098, (1, 0, 0), r=0.004, alt=0.004)
+
+    # placas frontais e para-choque
+    p.caixa((0.04, 0.36, 0.20), (0.52, 0, 0.27), 0.006)
+    p.caixa((0.014, 0.24, 0.10), (0.546, 0, 0.29), 0.003)
+    parafusos_retangulo((0.555, 0, 0.29), 0.22, 0.085, (1, 0, 0))
+    p.caixa((0.03, 0.30, 0.08), (0.555, 0, 0.46), 0.004)
+    p.caixa((0.012, 0.20, 0.045), (0.572, 0, 0.46), 0.002)
+    parafusos_retangulo((0.58, 0, 0.46), 0.185, 0.035, (1, 0, 0), r=0.0045, alt=0.005)
+    cabo(CAB, [(0.52, -0.20, 0.17), (0.64, -0.20, 0.17), (0.64, 0.20, 0.17), (0.52, 0.20, 0.17)], 0.014)
+    for s in (-1, 1):
+        cabo(CAB, [(0.64, s * 0.20, 0.17), (0.64, s * 0.20, 0.25), (0.545, s * 0.20, 0.30)], 0.011)
+    p.caixa((0.10, 0.28, 0.025), (0.575, 0, 0.145), 0.004)
+    parafusos_retangulo((0.575, 0, 0.1585), 0.08, 0.24, (0, 0, 1), r=0.005)
+
+    # traseira: grade, olhais de reboque
+    p.caixa((0.016, 0.34, 0.095), (-0.468, 0, 0.455), 0.003)
+    for i in range(6):
+        VENT.caixa((0.012, 0.30, 0.0075), (-0.478, 0, 0.42 + i * 0.0145), 0.0015)
+    for s in (-1, 1):
+        p.caixa((0.04, 0.05, 0.05), (-0.52, s * 0.15, 0.22), 0.004)
+        p.toro(0.022, 0.0055, (-0.545, s * 0.15, 0.22), (1, 0, 0))
+    p.caixa((0.03, 0.30, 0.18), (-0.515, 0, 0.26), 0.005)
+    parafusos_retangulo((-0.532, 0, 0.26), 0.26, 0.15, (-1, 0, 0))
+
+    # escotilhas de manutenção no teto da cabine
+    p.caixa((0.22, 0.16, 0.008), (0.20, 0.13, TOPO + 0.004), 0.002)
+    p.caixa((0.18, 0.12, 0.006), (0.20, 0.13, TOPO + 0.010), 0.002)
+    parafusos_retangulo((0.20, 0.13, TOPO + 0.014), 0.20, 0.14, (0, 0, 1), r=0.005, alt=0.005)
+    cabo(CAB, [(0.17, 0.13, TOPO + 0.015), (0.17, 0.13, TOPO + 0.03),
+               (0.23, 0.13, TOPO + 0.03), (0.23, 0.13, TOPO + 0.015)], 0.0055)
+    # escotilha lateral direita
+    p.caixa((0.14, 0.10, 0.008), (0.05, -0.15, TOPO + 0.004), 0.002)
+    parafusos_retangulo((0.05, -0.15, TOPO + 0.009), 0.12, 0.08, (0, 0, 1), r=0.0045, alt=0.004)
+
+    # caixa de equipamentos traseira (grande, no teto)
+    p.caixa((0.28, 0.34, 0.10), (-0.19, 0.0, TOPO + 0.05), 0.006)
+    p.caixa((0.26, 0.32, 0.012), (-0.19, 0.0, TOPO + 0.106), 0.003)
+    parafusos_retangulo((-0.19, 0, TOPO + 0.113), 0.24, 0.30, (0, 0, 1))
+    for s in (-1, 1):
+        p.caixa((0.02, 0.05, 0.03), (-0.05, s * 0.09, TOPO + 0.07), 0.003)   # fechos
+        p.cil(0.016, 0.03, (-0.19, s * 0.185, TOPO + 0.06), (0, 1, 0), seg=14)  # conectores
+        anel_parafusos((-0.19, s * 0.2, TOPO + 0.06), 0.012, 4, (0, 1, 0), r=0.003, h=0.004)
+    for i in range(5):
+        VENT.caixa((0.16, 0.012, 0.006), (-0.19, -0.06 + i * 0.03, TOPO + 0.114), 0.001)
+    # escapamento / respiro
+    p.cil(0.024, 0.06, (-0.10, 0.22, TOPO + 0.03), (0, 0, 1), seg=20)
+    p.cil(0.030, 0.014, (-0.10, 0.22, TOPO + 0.065), (0, 0, 1), seg=20)
+
+    # tubulações externas sobre o convés
+    cabo(CAB, [(0.34, 0.31, 0.535), (-0.28, 0.31, 0.535), (-0.28, 0.31, 0.55)], 0.012)
+    cabo(CAB, [(0.09, -0.31, 0.535), (-0.28, -0.31, 0.535)], 0.012)
+    for xx in (0.30, 0.10, -0.10, -0.26):
+        p.caixa((0.02, 0.02, 0.012), (xx, 0.31, 0.526), 0.002)
+    for xx in (0.05, -0.12, -0.26):
+        p.caixa((0.02, 0.02, 0.012), (xx, -0.31, 0.526), 0.002)
+    p.cil(0.017, 0.02, (0.34, 0.31, 0.535), (1, 0, 0), seg=14)
+    p.cil(0.017, 0.02, (0.09, -0.31, 0.535), (1, 0, 0), seg=14)
+    p.cil(0.017, 0.02, (-0.28, 0.31, 0.55), (0, 0, 1), seg=14)
+    # tubulação ao longo do teto da cabine
+    cabo(CAB, [(0.30, -0.24, TOPO + 0.012), (-0.02, -0.24, TOPO + 0.012),
+               (-0.02, -0.17, TOPO + 0.012), (-0.02, -0.17, TOPO + 0.05)], 0.008)
+    p.concluir()
+
+
+# ----------------------------------------------------------------------------
+# TORRE DE SENSORES
+# ----------------------------------------------------------------------------
+def construir_torre():
+    p = Peca("Torre_Sensores", "TORRE_DE_SENSORES")
+    Z0 = TOPO
+
+    # base giratória
+    p.cil(0.115, 0.03, (X0, 0, Z0 + 0.015), seg=40)
+    p.cil(0.095, 0.03, (X0, 0, Z0 + 0.045), seg=40)
+    anel_parafusos((X0, 0, Z0 + 0.03), 0.105, 14, (0, 0, 1), r=0.0065, h=0.006)
+
+    # coluna principal com reforços
+    p.caixa((0.15, 0.15, 0.37), (X0, 0, 0.815), 0.005)
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            p.caixa((0.025, 0.025, 0.37), (X0 + sx * 0.075, sy * 0.075, 0.815), 0.004)
+    p.caixa((0.17, 0.17, 0.02), (X0, 0, 0.64), 0.004)
+    p.caixa((0.17, 0.17, 0.02), (X0, 0, 0.99), 0.004)
+    for s in (-1, 1):
+        p.barra((X0 - 0.06, s * 0.079, 0.655), (X0 + 0.06, s * 0.079, 0.975), 0.008, 0.022)
+        p.barra((X0 - 0.06, s * 0.079, 0.975), (X0 + 0.06, s * 0.079, 0.655), 0.008, 0.022)
+        p.barra((X0 - 0.079, -0.06 * s, 0.655), (X0 - 0.079, 0.06 * s, 0.975), 0.008, 0.022)
+    p.barra((X0 + 0.079, -0.06, 0.655), (X0 + 0.079, 0.06, 0.975), 0.008, 0.022)
+    parafusos_retangulo((X0, 0.0835, 0.815), 0.12, 0.30, (0, 1, 0), r=0.0045, alt=0.004)
+    parafusos_retangulo((X0, -0.0835, 0.815), 0.12, 0.30, (0, -1, 0), r=0.0045, alt=0.004)
+
+    # câmera térmica (frontal inferior)
+    p.caixa((0.08, 0.17, 0.12), (X0 + 0.115, 0, 0.82), 0.006)
+    p.caixa((0.02, 0.12, 0.012), (X0 + 0.14, 0, 0.885), 0.003)   # viseira
+    lente(p, (X0 + 0.155, 0, 0.82), 0.036, (1, 0, 0), 0.03)
+    p.cil(0.048, 0.012, (X0 + 0.158, 0, 0.82), (1, 0, 0), seg=28, bisel=0.002)
+    for s in (-1, 1):
+        lente(p, (X0 + 0.155, s * 0.065, 0.845), 0.011, (1, 0, 0), 0.012)
+        PAR.cil(0.005, 0.005, (X0 + 0.156, s * 0.07, 0.775), (1, 0, 0), seg=6, bisel=0)
+    parafusos_retangulo((X0 + 0.155, 0, 0.82), 0.15, 0.10, (1, 0, 0), r=0.0045, alt=0.004)
+
+    # câmera lateral esquerda
+    p.caixa((0.05, 0.06, 0.04), (X0 - 0.02, 0.105, 0.88), 0.004)
+    p.cil(0.037, 0.09, (X0 + 0.01, 0.15, 0.88), (1, 0, 0), seg=28)
+    lente(p, (X0 + 0.055, 0.15, 0.88), 0.034, (1, 0, 0), 0.02)
+    p.cil(0.042, 0.012, (X0 - 0.025, 0.15, 0.88), (1, 0, 0), seg=28, bisel=0.002)
+
+    # módulo de radiação (direita) e caixas eletrônicas
+    p.caixa((0.04, 0.05, 0.05), (X0 - 0.02, -0.097, 0.78), 0.004)
+    p.cil(0.022, 0.15, (X0 - 0.02, -0.125, 0.78), seg=24)
+    for dz in (-0.05, 0.0, 0.05):
+        p.cil(0.028, 0.009, (X0 - 0.02, -0.125, 0.78 + dz), seg=24, bisel=0.002)
+    p.cil(0.016, 0.02, (X0 - 0.02, -0.125, 0.865), seg=16)
+    p.caixa((0.06, 0.12, 0.14), (X0 - 0.105, 0, 0.80), 0.005)
+    parafusos_retangulo((X0 - 0.136, 0, 0.80), 0.10, 0.12, (-1, 0, 0), r=0.0045, alt=0.004)
+    p.caixa((0.05, 0.05, 0.06), (X0 - 0.02, 0.095, 0.69), 0.004)
+    p.cil(0.014, 0.05, (X0 - 0.02, 0.12, 0.69), (0, 1, 0), seg=14)
+
+    # colar e anel de giro
+    p.cil(0.060, 0.12, (X0, 0, 1.06), seg=32)
+    p.cil(0.070, 0.016, (X0, 0, 1.025), seg=32, bisel=0.002)
+    p.cil(0.066, 0.012, (X0, 0, 1.105), seg=32, bisel=0.002)
+    anel_parafusos((X0, 0, 1.034), 0.069, 12, (0, 0, 1), r=0.0045, h=0.005)
+
+    # caixa de câmeras intermediária
+    p.caixa((0.13, 0.26, 0.085), (X0, 0, 1.1625), 0.006)
+    for s in (-1, 1):
+        lente(p, (X0 + 0.065, s * 0.07, 1.1625), 0.028, (1, 0, 0), 0.024)
+        # sensores de radiação cilíndricos laterais
+        p.caixa((0.04, 0.04, 0.04), (X0 - 0.02, s * 0.14, 1.15), 0.004)
+        p.cil(0.020, 0.13, (X0 - 0.02, s * 0.165, 1.16), seg=24)
+        p.cil(0.026, 0.009, (X0 - 0.02, s * 0.165, 1.125), seg=24, bisel=0.002)
+        p.cil(0.026, 0.009, (X0 - 0.02, s * 0.165, 1.195), seg=24, bisel=0.002)
+        p.cil(0.013, 0.02, (X0 - 0.02, s * 0.165, 1.232), seg=16)
+    lente(p, (X0 + 0.065, 0, 1.1625), 0.014, (1, 0, 0), 0.012)
+    parafusos_retangulo((X0 + 0.065, 0, 1.1625), 0.22, 0.06, (1, 0, 0), r=0.0045, alt=0.004)
+
+    # pescoço e cabeça de sensores
+    p.cil(0.050, 0.08, (X0, 0, 1.245), seg=28)
+    p.caixa((0.20, 0.34, 0.15), (X0, 0, 1.36), 0.008)
+    lente(p, (X0 + 0.10, 0, 1.36), 0.052, (1, 0, 0), 0.045)
+    p.cil(0.068, 0.012, (X0 + 0.106, 0, 1.36), (1, 0, 0), seg=36, bisel=0.002)
+    anel_parafusos((X0 + 0.114, 0, 1.36), 0.062, 8, (1, 0, 0), r=0.0045, h=0.004)
+    for s in (-1, 1):
+        p.caixa((0.10, 0.09, 0.10), (X0 + 0.05, s * 0.19, 1.36), 0.006)
+        lente(p, (X0 + 0.10, s * 0.19, 1.36), 0.032, (1, 0, 0), 0.028)
+        p.caixa((0.05, 0.10, 0.012), (X0 + 0.085, s * 0.19, 1.42), 0.003)  # viseira
+        for dz in (-1, 1):
+            lente(p, (X0 + 0.10, s * 0.112, 1.36 + dz * 0.035), 0.012, (1, 0, 0), 0.012)
+        p.caixa((0.04, 0.03, 0.05), (X0 + 0.02, s * 0.15, 1.36), 0.003)
+    p.caixa((0.06, 0.20, 0.10), (X0 - 0.12, 0, 1.36), 0.005)
+    parafusos_retangulo((X0 - 0.15, 0, 1.36), 0.17, 0.08, (-1, 0, 0), r=0.0045, alt=0.004)
+    p.caixa((0.18, 0.30, 0.02), (X0, 0, 1.445), 0.004)
+    parafusos_retangulo((X0, 0, 1.456), 0.16, 0.27, (0, 0, 1), r=0.0045, alt=0.004)
+
+    # LiDAR superior
+    p.cil(0.060, 0.03, (X0, 0, 1.46), seg=32)
+    p.cil(0.075, 0.07, (X0, 0, 1.51), seg=40)
+    p.cil(0.080, 0.008, (X0, 0, 1.485), seg=40, bisel=0.002)
+    p.cil(0.080, 0.008, (X0, 0, 1.537), seg=40, bisel=0.002)
+    p.cil(0.077, 0.022, (X0, 0, 1.511), seg=40, bisel=0.001)
+    p.cil(0.052, 0.020, (X0, 0, 1.555), seg=32)
+    p.cil(0.040, 0.030, (X0, 0, 1.58), r2=0.018, seg=24, bisel=0)
+    anel_parafusos((X0, 0, 1.4755), 0.055, 6, (0, 0, 1), r=0.0045, h=0.005)
+
+    # cabos e conduítes descendo pela torre
+    cabo(CAB, [(X0 - 0.085, -0.05, 1.29), (X0 - 0.085, -0.05, 1.0), (X0 - 0.085, -0.03, 0.65)], 0.008)
+    cabo(CAB, [(X0 + 0.01, 0.085, 0.88 - 0.0), (X0 + 0.01, 0.087, 0.70)], 0.006)
+    cabo(CAB, curva((X0 - 0.02, -0.125, 0.855), (X0 - 0.09, -0.125, 0.95), (X0 - 0.085, -0.05, 1.0)), 0.005)
+    p.concluir()
+
+
+# ----------------------------------------------------------------------------
+# BRAÇO ROBÓTICO
+# ----------------------------------------------------------------------------
+def construir_braco():
+    p = Peca("Braco_Robotico", "BRACO_ROBOTICO")
+    Y = -0.25
+    BX = 0.30
+    S = Vector((BX, Y, 0.74))
+    E = Vector((BX + 0.10, Y, 1.12))
+    W = Vector((BX + 0.62, Y, 1.20))
+    YA = (0, 1, 0)
+
+    # base rotativa
+    p.cil(0.085, 0.03, (BX, Y, TOPO + 0.015), seg=32)
+    p.cil(0.070, 0.04, (BX, Y, TOPO + 0.05), seg=32)
+    anel_parafusos((BX, Y, TOPO + 0.03), 0.078, 10, (0, 0, 1), r=0.0055, h=0.006)
+    p.cil(0.060, 0.05, (BX, Y, TOPO + 0.095), seg=28)
+    p.caixa((0.14, 0.12, 0.10), (BX - 0.015, Y, 0.665), 0.006)
+
+    # ombro: garfo, junta e tampas
+    for s in (-1, 1):
+        p.caixa((0.11, 0.028, 0.14), (BX, Y + s * 0.058, 0.725), 0.005)
+        p.cil(0.048, 0.022, (BX, Y + s * 0.083, S.z), YA, seg=28, bisel=0.002)
+        anel_parafusos((BX, Y + s * 0.096, S.z), 0.034, 6, (0, 1, 0), r=0.0045, h=0.004)
+    p.cil(0.062, 0.090, S, YA, seg=32)
+    p.cil(0.030, 0.140, S, YA, seg=20)
+
+    # segmento principal (braço)
+    p.barra(S, E, 0.072, 0.080, 0.005)
+    for s in (-1, 1):
+        p.barra(S + Vector((0.0, s * 0.040, 0.02)), E + Vector((0.0, s * 0.040, -0.02)), 0.012, 0.062, 0.003)
+    # carenagem do braço
+    pm = S + (E - S) * 0.5
+    p.caixa((0.11, 0.09, 0.09), pm + Vector((0.0, 0.0, 0.0)), 0.006)
+    parafusos_retangulo(pm + Vector((0, 0.046, 0)), 0.08, 0.07, (0, 1, 0), r=0.0045, alt=0.004)
+
+    # cotovelo: disco grande externo (característico) e garfo
+    for s in (-1, 1):
+        p.caixa((0.12, 0.026, 0.14), (E.x, Y + s * 0.050, E.z), 0.005)
+    p.cil(0.060, 0.090, E, YA, seg=32)
+    p.cil(0.072, 0.024, (E.x, Y - 0.070, E.z), YA, seg=36, bisel=0.003)
+    p.cil(0.050, 0.012, (E.x, Y - 0.088, E.z), YA, seg=32, bisel=0.002)
+    anel_parafusos((E.x, Y - 0.096, E.z), 0.038, 8, (0, -1, 0), r=0.0045, h=0.004)
+    p.cil(0.050, 0.020, (E.x, Y + 0.068, E.z), YA, seg=28, bisel=0.002)
+    # mangueira em anel envolvendo o cotovelo
+    p.toro(0.082, 0.0075, (E.x, Y + 0.095, E.z), YA)
+
+    # segundo segmento (antebraço)
+    p.barra(E, W, 0.066, 0.064, 0.005)
+    for s in (-1, 1):
+        p.barra(E + Vector((0.07, s * 0.038, 0.0)), W + Vector((-0.07, s * 0.038, 0.0)), 0.012, 0.050, 0.003)
+    pf = E + (W - E) * 0.45
+    p.caixa((0.12, 0.085, 0.085), pf, 0.006)
+    parafusos_retangulo(pf + Vector((0, 0.044, 0)), 0.09, 0.065, (0, 1, 0), r=0.0045, alt=0.004)
+    pf2 = E + (W - E) * 0.78
+    p.caixa((0.08, 0.075, 0.075), pf2, 0.005)
+
+    # punho
+    Gx = W.x + 0.03
+    for s in (-1, 1):
+        p.cil(0.048, 0.020, (W.x, Y + s * 0.050, W.z), YA, seg=28, bisel=0.002)
+    p.cil(0.045, 0.080, W, YA, seg=28)
+    p.caixa((0.10, 0.085, 0.08), (Gx, Y, W.z - 0.012), 0.006)
+    p.cil(0.040, 0.05, (Gx, Y, W.z - 0.065), seg=28)
+    p.cil(0.052, 0.012, (Gx, Y, W.z - 0.095), seg=28, bisel=0.002)
+    anel_parafusos((Gx, Y, W.z - 0.1015), 0.044, 8, (0, 0, -1), r=0.0045, h=0.004)
+
+    # garra com duas pinças
+    zf = W.z - 0.18
+    p.caixa((0.10, 0.125, 0.08), (Gx, Y, W.z - 0.14), 0.006)
+    p.caixa((0.07, 0.15, 0.03), (Gx, Y, zf + 0.020), 0.004)
+    base = [(0.020, 0.0), (0.065, 0.0), (0.080, -0.060), (0.062, -0.140),
+            (0.015, -0.200), (0.020, -0.130), (0.040, -0.070), (0.020, -0.040)]
+    for s in (1, -1):
+        pts = [(Y + s * dy, zf + dz) for dy, dz in base]
+        p.prisma(pts, Gx - 0.020, Gx + 0.020, 'YZ', 0.0015)
+        p.cil(0.013, 0.058, (Gx, Y + s * 0.050, zf - 0.012), (1, 0, 0), seg=14, bisel=0.002)
+        atuador(p, (Gx + 0.0, Y + s * 0.088, W.z - 0.115), (Gx + 0.0, Y + s * 0.062, zf - 0.015),
+                0.013, 0.007, 0.5, (1, 0, 0))
+        # dentes de aderência na face interna
+        for k in range(0):
+            p.caixa((0.034, 0.008, 0.010), (Gx, Y + s * (0.032 + 0.0 * k), zf - 0.075 - k * 0.025), 0.001)
+
+    # atuadores hidráulicos (olhais ligam suportes ao braço)
+    yo = Y - 0.115
+    A1 = Vector((BX - 0.10, yo, 0.665))
+    B1 = S + (E - S) * 0.50 + Vector((0.0, yo - Y, 0.0)) + Vector((0.0, 0.0, 0.0))
+    p.caixa((0.04, 0.050, 0.05), (BX - 0.10, Y - 0.085, 0.665), 0.004)
+    p.caixa((0.05, 0.065, 0.05), (B1.x, Y - 0.070, B1.z), 0.004)
+    atuador(p, A1, B1, 0.021, 0.012, 0.56)
+
+    A2 = S + (E - S) * 0.86 + Vector((-0.045, yo - Y, 0.0))
+    B2 = E + (W - E) * 0.40 + Vector((0.0, yo - Y, 0.065))
+    p.caixa((0.04, 0.065, 0.04), (A2.x, Y - 0.075, A2.z), 0.004)
+    p.caixa((0.04, 0.065, 0.04), (B2.x, Y - 0.075, B2.z - 0.02), 0.004)
+    atuador(p, A2, B2, 0.019, 0.011, 0.50)
+    p.concluir()
+
+    # cabos e conexões do braço
+    cabo(CAB, [(BX, Y + 0.03, TOPO + 0.12), (BX + 0.04, Y + 0.075, 0.80), (BX + 0.08, Y + 0.075, 1.06),
+               (BX + 0.18, Y + 0.075, 1.12)], 0.008)
+    cabo(CAB, curva((BX + 0.18, Y + 0.075, 1.12), (BX + 0.40, Y + 0.075, 1.19),
+                    (W.x - 0.05, Y + 0.075, W.z - 0.03), 8), 0.008)
+    cabo(CAB, curva((W.x - 0.05, Y + 0.075, W.z - 0.03), (W.x + 0.02, Y + 0.09, W.z - 0.08),
+                    (Gx, Y + 0.05, W.z - 0.12), 6), 0.007)
+    cabo(CAB, curva((BX + 0.02, Y - 0.04, 0.66), (BX + 0.10, Y - 0.12, 0.80), (BX + 0.12, Y - 0.095, 0.94), 6), 0.0055)
+
+
+# ----------------------------------------------------------------------------
+# ANTENAS E EQUIPAMENTOS
+# ----------------------------------------------------------------------------
+def antena(p, x, y, altura, r_mastro=0.0075):
+    p.cil(0.022, 0.03, (x, y, TOPO + 0.015), seg=20)
+    p.cil(0.016, 0.04, (x, y, TOPO + 0.05), seg=20)
+    anel_parafusos((x, y, TOPO + 0.032), 0.019, 5, (0, 0, 1), r=0.003, h=0.004)
+    for k in range(0):                                  # mola de base
+        p.cil(0.013, 0.006, (x, y, TOPO + 0.078 + k * 0.009), seg=14, bisel=0)
+    z0 = TOPO + 0.10
+    p.tubo((x, y, z0), (x, y, z0 + altura), r_mastro, seg=12, r2=0.0025)
+    p.cil(0.012, 0.02, (x, y, z0 + 0.01), seg=14)
+    p.cil(0.0045, 0.014, (x, y, z0 + altura + 0.005), seg=10, bisel=0)
+
+
+def construir_antenas_equipamentos():
+    p = Peca("Antenas_Equipamentos", "ANTENAS_E_EQUIPAMENTOS")
+    antena(p, -0.30, 0.20, 0.80)
+    antena(p, -0.31, -0.215, 0.52, 0.0065)
+
+    # GPS
+    p.cil(0.035, 0.02, (0.02, 0.21, TOPO + 0.01), seg=28)
+    p.cil(0.025, 0.014, (0.02, 0.21, TOPO + 0.027), seg=28)
+
+    # caixas de comunicação e eletrônica
+    p.caixa((0.14, 0.10, 0.07), (-0.12, -0.222, TOPO + 0.035), 0.005)
+    p.caixa((0.12, 0.08, 0.012), (-0.12, -0.222, TOPO + 0.076), 0.003)
+    parafusos_retangulo((-0.12, -0.222, TOPO + 0.083), 0.115, 0.075, (0, 0, 1), r=0.0045, alt=0.004)
+    for k in range(3):
+        p.cil(0.008, 0.02, (-0.17 + k * 0.025, -0.272, TOPO + 0.04), (0, -1, 0), seg=12)
+    p.caixa((0.09, 0.07, 0.05), (-0.40, 0.0, TOPO + 0.025), 0.004)
+    p.caixa((0.08, 0.06, 0.012), (-0.40, 0.0, TOPO + 0.056), 0.003)
+    p.caixa((0.08, 0.08, 0.05), (0.33, -0.10, TOPO + 0.025), 0.004)
+    parafusos_retangulo((0.33, -0.10, TOPO + 0.052), 0.065, 0.065, (0, 0, 1), r=0.0042, alt=0.004)
+    p.cil(0.018, 0.04, (0.33, -0.10, TOPO + 0.07), seg=16)
+
+    # cabos entre caixas e antenas
+    cabo(CAB, curva((-0.30, 0.20, TOPO + 0.04), (-0.28, 0.12, TOPO + 0.07), (-0.19, 0.17, TOPO + 0.10)), 0.0045)
+    cabo(CAB, curva((-0.31, -0.215, TOPO + 0.04), (-0.25, -0.215, TOPO + 0.07), (-0.19, -0.222, TOPO + 0.076)), 0.0045)
+    cabo(CAB, [(-0.40, 0.0, TOPO + 0.05), (-0.40, 0.0, TOPO + 0.09), (-0.30, 0.0, TOPO + 0.09)], 0.005)
+
+    # luzes de sinalização
+    for s in (-1, 1):
+        p.cil(0.014, 0.02, (-0.455, s * 0.25, 0.50), (-1, 0, 0), seg=16)
+        p.cil(0.010, 0.010, (-0.470, s * 0.25, 0.50), (-1, 0, 0), seg=16, bisel=0.001)
+    p.concluir()
+
+
+# ----------------------------------------------------------------------------
+# CÂMERA, LUZES, CENÁRIO
+# ----------------------------------------------------------------------------
+def criar_estudio():
+    sc = bpy.context.scene
+
+    # chão de estúdio (cilindro baixo escuro)
+    ch = Peca("Chao_Estudio", "DETALHES")
+    ch.cil(3.6, 0.02, (0.0, 0.0, -0.01), seg=96, bisel=0)
+    ch.concluir(MAT_CHAO)
+
+    alvo = bpy.data.objects.new("Alvo_Camera", None)
+    alvo.location = (0.05, 0.0, 0.78)
+    sc.collection.objects.link(alvo)
+
+    cd = bpy.data.cameras.new("Camera_Apresentacao")
+    cd.lens = 48
+    cd.clip_end = 100
+    cam = bpy.data.objects.new("Camera_Apresentacao", cd)
+    cam.location = (3.15, -2.75, 1.75)
+    sc.collection.objects.link(cam)
+    c = cam.constraints.new('TRACK_TO')
+    c.target = alvo
+    c.track_axis = 'TRACK_NEGATIVE_Z'
+    c.up_axis = 'UP_Y'
+    sc.camera = cam
+
+    def luz(nome, loc, energia, tam, cor=(1, 1, 1)):
+        d = bpy.data.lights.new(nome, 'AREA')
+        d.energy = energia
+        d.size = tam
+        d.color = cor
+        o = bpy.data.objects.new(nome, d)
+        o.location = loc
+        sc.collection.objects.link(o)
+        t = o.constraints.new('TRACK_TO')
+        t.target = alvo
+        t.track_axis = 'TRACK_NEGATIVE_Z'
+        t.up_axis = 'UP_Y'
+
+    luz("Luz_Principal", (2.6, -2.2, 3.2), 700, 2.2)
+    luz("Luz_Preenchimento", (-2.8, -2.4, 1.6), 260, 3.0, (0.92, 0.95, 1.0))
+    luz("Luz_Contorno", (-1.2, 2.8, 2.6), 420, 1.6)
+    luz("Luz_Topo", (0.0, 0.0, 4.0), 260, 3.0)
+
+    # mundo escuro
+    if sc.world is None:
+        sc.world = bpy.data.worlds.new("Mundo_Estudio")
+    sc.world.use_nodes = True
+    bg = sc.world.node_tree.nodes.get("Background")
+    if bg:
+        bg.inputs[0].default_value = (0.035, 0.035, 0.04, 1)
+        bg.inputs[1].default_value = 1.0
+
+    # render
+    sc.render.engine = 'CYCLES'
+    sc.cycles.samples = 96
+    sc.render.resolution_x = 1920
+    sc.render.resolution_y = 1280
+    sc.render.resolution_percentage = 100
+
+    # mostrar a câmera no viewport
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.spaces[0].region_3d.view_perspective = 'CAMERA'
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# PRINCIPAL
+# ----------------------------------------------------------------------------
+def main():
+    global PAR, CAB, VENT
+    limpar_cena()
+    criar_colecoes()
+    criar_materiais()
+
+    PAR = Peca("Parafusos_Rebites", "DETALHES")
+    CAB = Peca("Cabos_Mangueiras_Alcas", "DETALHES")
+    VENT = Peca("Grades_Ventilacao", "DETALHES")
+
+    seg = malha_segmento()
+    seg.materials.append(MAT)
+    for nome, cx, lado in (("Esteira_DE", 0.375, 1), ("Esteira_DD", 0.375, -1),
+                           ("Esteira_TE", -0.375, 1), ("Esteira_TD", -0.375, -1)):
+        construir_esteira(nome, cx, lado, seg)
+
+    construir_chassi()
+    construir_torre()
+    construir_braco()
+    construir_antenas_equipamentos()
+
+    CAB.concluir()   # so mangueiras grossas e para-choque (PAR e VENT descartados)
+    criar_estudio()
+    print("CHERNOBYL-01 construído com sucesso.")
+
+
+main()
